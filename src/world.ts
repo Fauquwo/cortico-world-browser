@@ -1,0 +1,1066 @@
+/**
+ * Browser World：把本机 web-access 的 CDP proxy 接成一个浏览器。
+ *
+ * 环境是操作员日常用的那个浏览器（带着他所有网站的登录态）。这个类做三件事：
+ * 管 proxy 的起停、把工具调用翻译成 HTTP 调用、把浏览器里他自己的动向报成事件。
+ *
+ * 起停沿用 SenseVoice 那一套：先探活，通了就复用（他自己或 coding agent 已经在跑的情况下
+ * 不重复拉起），探不通才 spawn，`stop()` 只关自己拉起的那个。起不来不抛错——投一条
+ * `browser.down`，让工具去报失败，这样 bot 知道「手现在不能用」，而不是这个 World 整个消失。
+ */
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import type {
+  Logger,
+  ToolCallContext,
+  ToolDef,
+  ToolOutcome,
+  World,
+  WorldConsoleDecl,
+  WorldHost,
+  WorldLamp,
+} from 'cortico/core/types.ts';
+import { nowIso } from 'cortico/core/util.ts';
+import { CdpRelay, RelayError, runFindUrl, type EvalResult, type PageTarget } from './cdp-client.ts';
+import { BROWSER_CONFIG_GROUP, type BrowserConfigSection } from './config.ts';
+import { readExpression, typeExpression } from './page-scripts.ts';
+
+const ENV_PROMPT_FILE = fileURLToPath(new URL('./ENV_PROMPT.md', import.meta.url));
+
+/** 开页时顺手读回的正文上限：够看清这个页面在讲什么，又不把上下文塞满。 */
+const OPEN_TEXT_MAX = 4000;
+/** `browser_read` 的默认值与上限。 */
+const READ_TEXT_DEFAULT = 8000;
+const READ_TEXT_MAX = 40000;
+/** 回执里列几条链接。 */
+const LINKS_SHOWN = 20;
+/** `browser_js` 回执里值序列化之后的上限。 */
+const JS_VALUE_MAX = 30000;
+/** 一次动向回执最多列几条，以及环形队列的容量。 */
+const ACTIVITY_LINES_MAX = 12;
+const ACTIVITY_KEEP = 40;
+/** 连续取不到快照多少次才认定掉线；一次网络抖动不算。 */
+const POLL_FAILURES_BEFORE_DOWN = 2;
+/** 等就绪的轮询间隔。 */
+const READY_POLL_MS = 1000;
+/** `find-url.mjs` 跑一次的上限：它要开本机的 sqlite 历史库。 */
+const FIND_URL_TIMEOUT_MS = 20000;
+
+/** 浏览器的内部页面不进动态：那不是「他去了哪儿」。 */
+const INTERNAL_URL = /^(chrome|edge|brave|about|devtools|chrome-extension|extension|chrome-untrusted):/i;
+
+const KIND_VERB: Record<ActivityEntry['kind'], string> = { opened: '打开', moved: '转到', closed: '关掉' };
+
+interface ActivityEntry {
+  ts: string;
+  kind: 'opened' | 'moved' | 'closed';
+  label: string;
+}
+
+interface SeenPage {
+  url: string;
+  title: string;
+}
+
+/** `browser_read` 读回来的页面。 */
+interface PageDump {
+  title: string;
+  url: string;
+  ready: string;
+  text: string;
+  links: Array<{ text: string; url: string }>;
+  truncated: boolean;
+  error?: string;
+}
+
+export interface BrowserWorldOptions {
+  /** `worlds.browser` 的活引用。 */
+  cfg: BrowserConfigSection;
+  timezone: string;
+}
+
+export class BrowserWorld implements World {
+  readonly id = 'browser';
+
+  private readonly relay: CdpRelay;
+  private host: WorldHost | null = null;
+  private running = false;
+  private state: 'idle' | 'starting' | 'ready' | 'failed' = 'idle';
+  private lastError = '';
+  /** proxy 报的浏览器名，没有时为配置里的那个。 */
+  private browserLabel = '';
+  /** 自己开的页面；只有这些允许关。 */
+  private readonly mine = new Set<string>();
+  /** 上一次快照：targetId → 页面。 */
+  private readonly seen = new Map<string, SeenPage>();
+  private primed = false;
+  private activity: ActivityEntry[] = [];
+  private activityArmed = false;
+  private pollTimer: NodeJS.Timeout | null = null;
+  private pollFailures = 0;
+  private recoveryTried = false;
+
+  constructor(private readonly opts: BrowserWorldOptions) {
+    const cfg = opts.cfg;
+    this.relay = new CdpRelay({
+      skillDir: cfg.skillDir.trim(),
+      browser: cfg.browser.trim(),
+      port: cfg.port,
+      tabIdleMinutes: cfg.tabIdleMinutes,
+    });
+  }
+
+  /** 模板里的两个占位符：操作哪个浏览器、他的上网动向报不报。 */
+  envPromptVars(): Record<string, string> {
+    return {
+      'browser.label': displayBrowser(this.opts.cfg.browser),
+      'browser.watching': this.opts.cfg.watchActivity ? '会' : '不会',
+    };
+  }
+
+  console(): WorldConsoleDecl {
+    const cfg = this.opts.cfg;
+    return {
+      lamps: [this.lamp()],
+      badges: [
+        { label: '浏览器', value: this.browserLabel || displayBrowser(cfg.browser) || '未配置', tone: 'plain' },
+        { label: 'proxy', value: `127.0.0.1:${cfg.port}`, tone: 'plain' },
+        { label: '她开的页', value: this.mine.size, tone: 'plain' },
+      ],
+      config: [BROWSER_CONFIG_GROUP],
+      promptDocs: [
+        {
+          key: 'worlds.browser.envPrompt',
+          title: 'Browser · 环境提示词',
+          description: '这个浏览器这一段进 system 前缀的说明；留空则该 World 不进入前缀。',
+          path: ENV_PROMPT_FILE,
+          role: 'envPrompt',
+          vars: [
+            { name: 'browser.label', description: '当前配置要操作的浏览器。' },
+            { name: 'browser.watching', description: '他的上网动向此刻会不会进上下文。' },
+          ],
+        },
+      ],
+    };
+  }
+
+  async start(host: WorldHost): Promise<void> {
+    this.host = host;
+    this.running = true;
+    const log = host.log.child(this.id);
+    try {
+      const health = await this.relay.probe();
+      if (health) {
+        this.browserLabel = health.browserLabel || health.browserId;
+        if (await this.relay.reachable()) {
+          this.state = 'ready';
+          log.info('复用已在运行的 cdp-proxy', { endpoint: this.relay.endpoint(), browser: this.browserLabel });
+          await this.emit(
+            'browser.ready',
+            `浏览器已就绪（复用了已在运行的 proxy，${this.relay.endpoint()}，${this.browserLabel || '浏览器未识别'}）。`,
+          );
+          this.startPolling(log);
+          return;
+        }
+        // 端口上已经有 proxy 了，但浏览器没接上。不再拉起一个去抢端口。
+        this.state = 'failed';
+        this.lastError = '已经有一个 proxy 在跑，但它没连上浏览器';
+        log.warn('复用的 proxy 没连上浏览器');
+        await this.emit('browser.down', `浏览器不可用：${this.lastError}。${this.connectHint()}`);
+        this.startPolling(log);
+        return;
+      }
+
+      this.state = 'starting';
+      const portProblem = await this.relay.checkPort();
+      if (portProblem) {
+        this.state = 'failed';
+        this.lastError = portProblem;
+        log.warn('这个端口用不了，不拉了', { error: portProblem });
+        await this.emit('browser.down', `浏览器起不来：${portProblem}${this.connectHint()}`);
+        return;
+      }
+      if (!this.relay.spawnProxy(log)) {
+        this.state = 'failed';
+        this.lastError = this.relay.failure;
+        await this.emit('browser.down', `浏览器起不来：${this.lastError}。${this.connectHint()}`);
+        return;
+      }
+      if (!(await this.waitReady(this.opts.cfg.readyTimeoutMs))) {
+        this.state = 'failed';
+        this.lastError = this.relay.failure || '等它连上浏览器超时';
+        log.warn('cdp-proxy 没能连上浏览器', { error: this.lastError });
+        await this.emit('browser.down', `浏览器没能就绪：${this.lastError}。${this.connectHint()}`);
+        this.startPolling(log);
+        return;
+      }
+      this.state = 'ready';
+      log.info('浏览器已就绪', { endpoint: this.relay.endpoint(), browser: this.browserLabel });
+      await this.emit('browser.ready', `浏览器已就绪（${this.relay.endpoint()}，${this.browserLabel || displayBrowser(this.opts.cfg.browser)}）。`);
+      this.startPolling(log);
+    } catch (err) {
+      this.state = 'failed';
+      this.lastError = describe(err);
+      log.error('启动 Browser World 时出错', err);
+    }
+  }
+
+  async stop(): Promise<void> {
+    this.running = false;
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
+    }
+    await this.relay.stop(); // 只关自己拉起的那个
+    this.state = 'idle';
+    this.host = null;
+    this.activity = [];
+    this.activityArmed = false;
+    // 下一次 start 的第一轮快照只打底：否则已经开着的页面会被当成刚打开。
+    this.seen.clear();
+    this.primed = false;
+    this.pollFailures = 0;
+    this.recoveryTried = false;
+  }
+
+  // ——— 状态与轮询 ———
+
+  private async waitReady(timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + Math.max(1000, timeoutMs);
+    while (Date.now() < deadline) {
+      if (await this.relay.reachable(READY_POLL_MS * 2)) return true;
+      if (!this.running) return false;
+      await sleep(READY_POLL_MS);
+    }
+    return false;
+  }
+
+  /** 轮询同时兜着两件事：他的动向，以及「掉线之后又回来了」。 */
+  private startPolling(log: Logger): void {
+    if (this.pollTimer) return;
+    const interval = Math.max(1000, this.opts.cfg.pollIntervalMs);
+    this.pollTimer = setInterval(() => void this.poll(log), interval);
+    this.pollTimer.unref();
+  }
+
+  private async poll(log: Logger): Promise<void> {
+    if (!this.running) return;
+    let targets: PageTarget[];
+    try {
+      targets = await this.relay.targets(this.timeout());
+    } catch (err) {
+      this.pollFailures += 1;
+      if (this.pollFailures === POLL_FAILURES_BEFORE_DOWN) {
+        const reason = describe(err);
+        log.warn('取不到浏览器快照', { err: reason });
+        if (this.state === 'ready') {
+          this.state = 'failed';
+          this.lastError = reason;
+          await this.emit('browser.down', `浏览器不可用了：${reason}。${this.connectHint()}`);
+        }
+        void this.maybeRelaunch(log);
+      }
+      return;
+    }
+    this.pollFailures = 0;
+    this.recoveryTried = false;
+    if (this.state !== 'ready') {
+      this.state = 'ready';
+      this.lastError = '';
+      await this.emit('browser.ready', `浏览器又连上了（${this.relay.endpoint()}）。`);
+    }
+    this.diff(targets);
+  }
+
+  /** proxy 死了不会自己回来。整场只补拉一次，避免对着关掉的浏览器反复拉起。 */
+  private async maybeRelaunch(log: Logger): Promise<void> {
+    if (this.recoveryTried || this.relay.owned || !this.opts.cfg.skillDir.trim()) return;
+    this.recoveryTried = true;
+    const portProblem = await this.relay.checkPort();
+    if (portProblem) {
+      log.warn('端口用不了，不补拉了', { error: portProblem });
+      return;
+    }
+    log.info('proxy 不在了，补拉一次');
+    if (!this.relay.spawnProxy(log)) return;
+    if (!(await this.waitReady(this.opts.cfg.readyTimeoutMs))) log.warn('补拉的 proxy 也没能连上浏览器');
+  }
+
+  /** 与上一次快照取差。只报不是她自己开的那几个页面。 */
+  private diff(targets: readonly PageTarget[]): void {
+    const changes: ActivityEntry[] = [];
+    const present = new Set<string>();
+    for (const target of targets) {
+      if (INTERNAL_URL.test(target.url)) continue;
+      present.add(target.targetId);
+      const previous = this.seen.get(target.targetId);
+      if (previous && previous.url === target.url && previous.title === target.title) continue;
+      this.seen.set(target.targetId, { url: target.url, title: target.title });
+      if (!this.primed || this.mine.has(target.targetId)) continue;
+      changes.push({
+        ts: nowIso(this.opts.timezone),
+        kind: previous ? 'moved' : 'opened',
+        label: labelOf({ url: target.url, title: target.title }),
+      });
+    }
+    for (const [targetId, page] of [...this.seen]) {
+      if (present.has(targetId)) continue;
+      this.seen.delete(targetId);
+      if (!this.primed || this.mine.has(targetId)) continue;
+      changes.push({ ts: nowIso(this.opts.timezone), kind: 'closed', label: labelOf(page) });
+    }
+    this.primed = true;
+    if (changes.length > 0 && this.opts.cfg.watchActivity) this.noteActivity(changes);
+  }
+
+  /**
+   * 攒着，用延迟渲染投一条。
+   *
+   * `piggyback` 不触发计时、不参与外部事件计数，所以他刷一天网页也不会把她叫起来烧钱——
+   * 等他开口时，这一段才随那批事件进上下文。想让她当场就知道，把 `wakeOnActivity` 打开。
+   */
+  private noteActivity(entries: readonly ActivityEntry[]): void {
+    this.activity.push(...entries);
+    const extra = this.activity.length - ACTIVITY_KEEP;
+    if (extra > 0) this.activity.splice(0, extra);
+    const host = this.host;
+    if (!host || this.activityArmed) return;
+    this.activityArmed = true;
+    host.pushDeferred(
+      {
+        type: 'browser.activity',
+        tags: ['snapshot'],
+        render: () => {
+          this.activityArmed = false;
+          return this.renderActivity();
+        },
+      },
+      { trigger: this.opts.cfg.wakeOnActivity ? 'debounce' : 'piggyback' },
+    );
+  }
+
+  private renderActivity(): string | null {
+    if (this.activity.length === 0) return null;
+    const entries = this.activity.splice(0, this.activity.length);
+    const shown = entries.slice(-ACTIVITY_LINES_MAX);
+    const lines = shown.map((entry) => `  ${entry.ts.slice(11, 16)} ${KIND_VERB[entry.kind]} ${entry.label}`);
+    const head = `[浏览器动向] 他刚在${this.browserLabel || displayBrowser(this.opts.cfg.browser) || '浏览器'}里：`;
+    const tail = entries.length > shown.length ? `  （另有 ${entries.length - shown.length} 条更早的）` : null;
+    return [head, ...lines, tail].filter((line): line is string => line !== null).join('\n');
+  }
+
+  private lamp(): WorldLamp {
+    switch (this.state) {
+      case 'ready':
+        return { label: '浏览器', state: 'online', hint: `${this.browserLabel || displayBrowser(this.opts.cfg.browser)} · ${this.relay.endpoint()}` };
+      case 'starting':
+        return { label: '浏览器', state: 'loading', hint: `${this.relay.endpoint()} · 等它连上浏览器` };
+      case 'failed':
+        return { label: '浏览器', state: 'error', hint: this.lastError || '连不上浏览器' };
+      default:
+        return { label: '浏览器', state: 'offline', hint: `${this.relay.endpoint()} · 未启动` };
+    }
+  }
+
+  private async emit(type: string, text: string): Promise<void> {
+    const host = this.host;
+    if (!host) return;
+    try {
+      await host.pushEvent({
+        type,
+        ts: nowIso(this.opts.timezone),
+        source: this.id,
+        origin: 'internal',
+        senderKey: this.id,
+        text,
+      });
+    } catch {
+      // 投递失败不该把 World 自己带崩
+    }
+  }
+
+  private connectHint(): string {
+    if (/端口/.test(this.lastError)) {
+      return '（换一个没被占用的 worlds.browser.port：Windows 保留的端口段会报 EACCES。）';
+    }
+    const browser = this.opts.cfg.browser.trim() || 'chrome';
+    return (
+      `（要在${displayBrowser(browser)}的地址栏打开 ${browser}://inspect/#remote-debugging，` +
+      '勾选「Allow remote debugging for this browser instance」。）'
+    );
+  }
+
+  private timeout(): number {
+    return Math.max(3000, this.opts.cfg.requestTimeoutMs);
+  }
+
+  /** 工具调用前的现查：状态可能是陈旧的，先探一次再决定要不要报不可用。 */
+  private async ensureReady(): Promise<string | null> {
+    if (this.state === 'ready') return null;
+    if (await this.relay.reachable(this.timeout())) {
+      this.state = 'ready';
+      this.lastError = '';
+      return null;
+    }
+    const port = this.relay.endpoint();
+    const reason = this.lastError || this.relay.failure || '没连上浏览器';
+    return `浏览器不可用（${port}）：${reason}。${this.connectHint()}`;
+  }
+
+  // ——— 工具 ———
+
+  tools(): ToolDef[] {
+    return [
+      this.openTool(),
+      this.readTool(),
+      this.jsTool(),
+      this.clickTool(),
+      this.typeTool(),
+      this.uploadTool(),
+      this.scrollTool(),
+      this.shotTool(),
+      this.navigateTool(),
+      this.tabsTool(),
+      this.closeTool(),
+      this.findUrlTool(),
+    ];
+  }
+
+  private openTool(): ToolDef {
+    return {
+      name: 'browser_open',
+      description:
+        'Open a page in a new background tab in the operator\'s own browser and return what the page shows: ' +
+        'title, URL, its readable text and its links. The tab carries the operator\'s login state. ' +
+        'Use the returned `target` value for every later call on that page. ' +
+        'A URL written without a scheme gets https:// in front of it.',
+      tags: ['act', 'snapshot'],
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          url: { type: 'string', description: 'Address to open, for example `example.com/report`.' },
+        },
+        required: ['url'],
+      },
+      handler: async (args, ctx) => this.open(args, ctx),
+    };
+  }
+
+  private readTool(): ToolDef {
+    return {
+      name: 'browser_read',
+      description:
+        'Read the readable text and links of a page you already opened, by `target`. ' +
+        'Pass `selector` to read one part of the page instead of the whole document. ' +
+        'Text reaching the limit is cut and flagged. `ready` is the document readyState, not proof the ' +
+        'content you want has appeared.',
+      tags: ['read', 'snapshot'],
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          target: { type: 'string', description: 'Target id returned by browser_open or browser_tabs.' },
+          selector: { type: 'string', description: 'CSS selector to read inside, for example `main article`.' },
+          maxChars: { type: 'integer', description: `How much text to return; default ${READ_TEXT_DEFAULT}, max ${READ_TEXT_MAX}.` },
+        },
+        required: ['target'],
+      },
+      handler: async (args, ctx) => this.read(args, ctx),
+    };
+  }
+
+  private jsTool(): ToolDef {
+    return {
+      name: 'browser_js',
+      description:
+        'Evaluate one JavaScript expression inside the page and return its value. This is the escape hatch when ' +
+        'the other tools do not cover what the page needs. Expressions only: to run several statements, wrap them ' +
+        'yourself as `(async () => { ... })()` and return a value. A thrown error comes back as a failed receipt. ' +
+        'The value must be JSON-serializable; DOM nodes and functions come back as their names.',
+      tags: ['act'],
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          target: { type: 'string', description: 'Target id returned by browser_open or browser_tabs.' },
+          expression: { type: 'string', description: 'JavaScript expression, for example `document.querySelectorAll("a").length`.' },
+        },
+        required: ['target', 'expression'],
+      },
+      handler: async (args, ctx) => this.js(args, ctx),
+    };
+  }
+
+  private clickTool(): ToolDef {
+    return {
+      name: 'browser_click',
+      description:
+        'Click the first element matching a CSS selector. Default is a JS click, which covers most cases. ' +
+        '`native: true` sends a real mouse event at the element\'s centre: use it when the page ignores a JS click, ' +
+        'when the click should count as a user gesture, or when it should open a file dialog. ' +
+        'Returns what was clicked and the page\'s title and URL right after.',
+      tags: ['act'],
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          target: { type: 'string', description: 'Target id returned by browser_open or browser_tabs.' },
+          selector: { type: 'string', description: 'CSS selector of the element to click.' },
+          native: { type: 'boolean', description: 'Send a real mouse event instead of `el.click()`.' },
+        },
+        required: ['target', 'selector'],
+      },
+      handler: async (args, ctx) => this.click(args, ctx),
+    };
+  }
+
+  private typeTool(): ToolDef {
+    return {
+      name: 'browser_type',
+      description:
+        'Type a value into an input, textarea, select or contenteditable element, then fire input and change events ' +
+        'so frameworks notice. `submit: true` sends the value and submits: the containing form when there is one, ' +
+        'otherwise an Enter key press on the element.',
+      tags: ['act'],
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          target: { type: 'string', description: 'Target id returned by browser_open or browser_tabs.' },
+          selector: { type: 'string', description: 'CSS selector of the field.' },
+          value: { type: 'string', description: 'Text to put in, or the option of a select.' },
+          submit: { type: 'boolean', description: 'Submit after typing.' },
+        },
+        required: ['target', 'selector', 'value'],
+      },
+      handler: async (args, ctx) => this.type(args, ctx),
+    };
+  }
+
+  private uploadTool(): ToolDef {
+    return {
+      name: 'browser_upload',
+      description:
+        'Attach local files to a page\'s file input, bypassing the file dialog. ' +
+        '`files` are absolute paths on this machine — a file in your own workspace is one.',
+      tags: ['act'],
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          target: { type: 'string', description: 'Target id returned by browser_open or browser_tabs.' },
+          selector: { type: 'string', description: 'CSS selector of the `input[type=file]`.' },
+          files: { type: 'array', items: { type: 'string' }, description: 'Absolute paths to attach.' },
+        },
+        required: ['target', 'selector', 'files'],
+      },
+      handler: async (args, ctx) => this.upload(args, ctx),
+    };
+  }
+
+  private scrollTool(): ToolDef {
+    return {
+      name: 'browser_scroll',
+      description:
+        'Scroll the page. `to: bottom` is the usual one: it loads lazy content, so images and later sections ' +
+        'exist in the DOM afterwards. `y` is the distance for `down` and `up`.',
+      tags: ['act'],
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          target: { type: 'string', description: 'Target id returned by browser_open or browser_tabs.' },
+          to: { type: 'string', enum: ['down', 'up', 'top', 'bottom'], description: 'Where to scroll; default `down`.' },
+          y: { type: 'integer', description: 'Pixels for `down` / `up`; default 3000.' },
+        },
+        required: ['target'],
+      },
+      handler: async (args, ctx) => this.scroll(args, ctx),
+    };
+  }
+
+  private shotTool(): ToolDef {
+    return {
+      name: 'browser_shot',
+      description:
+        'Capture one screenshot of the page and attach it to the receipt. The image is the viewport, not the whole ' +
+        'document. Use it when the content is in images, canvas or video, where the readable text comes back empty ' +
+        'or thin — and scroll first if the part you need is further down.',
+      tags: ['read'],
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          target: { type: 'string', description: 'Target id returned by browser_open or browser_tabs.' },
+        },
+        required: ['target'],
+      },
+      handler: async (args, ctx) => this.shot(args, ctx),
+    };
+  }
+
+  private navigateTool(): ToolDef {
+    return {
+      name: 'browser_navigate',
+      description:
+        'Move an existing tab to another address, or go back one entry. Use `browser_open` instead when you want ' +
+        'a second page at the same time. A URL without a scheme gets https:// in front of it.',
+      tags: ['act', 'snapshot'],
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          target: { type: 'string', description: 'Target id returned by browser_open or browser_tabs.' },
+          url: { type: 'string', description: 'Address to move to.' },
+          back: { type: 'boolean', description: 'Go back one entry in this tab\'s history instead.' },
+        },
+        required: ['target'],
+      },
+      handler: async (args, ctx) => this.navigate(args, ctx),
+    };
+  }
+
+  private tabsTool(): ToolDef {
+    return {
+      name: 'browser_tabs',
+      description:
+        'List the pages open in the browser right now: what the operator has open and what you opened. ' +
+        'Each entry is marked `mine: true` when you opened it — those are the only ones `browser_close` accepts.',
+      tags: ['read', 'snapshot'],
+      parameters: { type: 'object', additionalProperties: false, properties: {} },
+      handler: async () => this.tabs(),
+    };
+  }
+
+  private closeTool(): ToolDef {
+    return {
+      name: 'browser_close',
+      description:
+        'Close a page you opened. Pages the operator opened are refused on purpose: closing one loses his state. ' +
+        'Your pages are also closed automatically when they sit idle, so this is for tidying up sooner than that.',
+      tags: ['act'],
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          target: { type: 'string', description: 'Target id of a page you opened.' },
+        },
+        required: ['target'],
+      },
+      handler: async (args, ctx) => this.close(args, ctx),
+    };
+  }
+
+  private findUrlTool(): ToolDef {
+    return {
+      name: 'browser_find_url',
+      description:
+        'Search this machine\'s browser bookmarks and history for a URL. Use it when the target is something the ' +
+        'operator has visited — a page he mentions by name, an internal system no search engine can reach. ' +
+        'Keywords are AND-ed and match title and URL. Returns the tool\'s own listing text.',
+      tags: ['read', 'snapshot'],
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          keywords: { type: 'array', items: { type: 'string' }, description: 'Words to match, all of them.' },
+          only: { type: 'string', enum: ['bookmarks', 'history'], description: 'Search one source only.' },
+          browser: { type: 'string', enum: ['chrome', 'edge'], description: 'Limit to one browser\'s data.' },
+          limit: { type: 'integer', description: 'How many results; default 20 in the tool itself.' },
+          since: { type: 'string', description: 'History only: `1d`, `7h`, `30m` or `YYYY-MM-DD`.' },
+          sort: { type: 'string', enum: ['recent', 'visits'], description: 'History only: by last visit or by visit count.' },
+        },
+        required: [],
+      },
+      handler: async (args, ctx) => this.findUrl(args, ctx),
+    };
+  }
+
+  // ——— 工具实现 ———
+
+  private async open(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {
+    const raw = str(args.url);
+    if (!raw) return fail('url 是空的：给一个要打开的地址。');
+    const notReady = await this.ensureReady();
+    if (notReady) return fail(notReady);
+
+    let targetId: string;
+    try {
+      targetId = await this.relay.open(withScheme(raw), this.timeout(), ctx.signal);
+    } catch (err) {
+      return fail(this.explain(err, 'open'));
+    }
+    this.mine.add(targetId);
+    const page = await this.dump(targetId, null, OPEN_TEXT_MAX, ctx);
+    if (!page.ok) return fail(`页面已打开（target ${targetId}），但没能读回内容：${page.text}`);
+    return { text: [`已打开（target ${targetId}）。`, renderPage(page.page, OPEN_TEXT_MAX)].join('\n') };
+  }
+
+  private async read(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {
+    const target = str(args.target);
+    if (!target) return fail('target 是空的：给 browser_open 或 browser_tabs 回的那个 target。');
+    const notReady = await this.ensureReady();
+    if (notReady) return fail(notReady);
+
+    const selector = str(args.selector) || null;
+    const maxChars = clampInt(args.maxChars, READ_TEXT_DEFAULT, 200, READ_TEXT_MAX);
+    const page = await this.dump(target, selector, maxChars, ctx);
+    if (!page.ok) return fail(page.text);
+    return { text: renderPage(page.page, maxChars) };
+  }
+
+  private async js(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {
+    const target = str(args.target);
+    const expression = str(args.expression);
+    if (!target) return fail('target 是空的：给 browser_open 或 browser_tabs 回的那个 target。');
+    if (!expression) return fail('expression 是空的：给一段要在页面里求值的 JS 表达式。');
+    const notReady = await this.ensureReady();
+    if (notReady) return fail(notReady);
+
+    let result: EvalResult;
+    try {
+      result = await this.relay.evaluate(target, expression, this.timeout(), ctx.signal);
+    } catch (err) {
+      return fail(this.explain(err, 'eval'));
+    }
+    if (!result.ok) return fail(`页面里那句 JS 抛了错：\n${truncate(result.error, 2000)}`);
+    return { text: `页面里求值的结果：\n${renderValue(result.value, JS_VALUE_MAX)}` };
+  }
+
+  private async click(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {
+    const target = str(args.target);
+    const selector = str(args.selector);
+    if (!target) return fail('target 是空的：给 browser_open 或 browser_tabs 回的那个 target。');
+    if (!selector) return fail('selector 是空的：给一个 CSS 选择器。');
+    const notReady = await this.ensureReady();
+    if (notReady) return fail(notReady);
+
+    const native = args.native === true;
+    try {
+      const clicked = await this.relay.click(target, selector, native, this.timeout(), ctx.signal);
+      const info = await this.relay.info(target, this.timeout(), ctx.signal).catch(() => null);
+      const head = `已点击 ${native ? '（真实鼠标）' : ''}：${clicked.tag}${clicked.text ? ` 「${truncate(clicked.text, 80)}」` : ''}`;
+      const tail = info ? `点击后此刻：${info.title || '(无标题)'} · ${info.url}（${info.ready}）` : null;
+      return { text: [head, tail].filter((line): line is string => line !== null).join('\n') };
+    } catch (err) {
+      return fail(this.explain(err, 'click'));
+    }
+  }
+
+  private async type(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {
+    const target = str(args.target);
+    const selector = str(args.selector);
+    const value = typeof args.value === 'string' ? args.value : '';
+    if (!target) return fail('target 是空的：给 browser_open 或 browser_tabs 回的那个 target。');
+    if (!selector) return fail('selector 是空的：给一个 CSS 选择器。');
+    const notReady = await this.ensureReady();
+    if (notReady) return fail(notReady);
+
+    let result: EvalResult;
+    try {
+      result = await this.relay.evaluate(
+        target,
+        typeExpression(selector, value, args.submit === true),
+        this.timeout(),
+        ctx.signal,
+      );
+    } catch (err) {
+      return fail(this.explain(err, 'type'));
+    }
+    if (!result.ok) return fail(`页面里那句 JS 抛了错：\n${truncate(result.error, 2000)}`);
+    const outcome = result.value as { ok?: unknown; error?: unknown; applied?: unknown; value?: unknown; submitted?: unknown };
+    if (!outcome || outcome.ok !== true) {
+      return fail(`没填进去：${typeof outcome?.error === 'string' ? outcome.error : '页面上没有这个元素'}`);
+    }
+    const applied = typeof outcome.applied === 'string' ? outcome.applied : '';
+    const current = typeof outcome.value === 'string' ? outcome.value : '';
+    const submitted = typeof outcome.submitted === 'string' ? `，已提交（${outcome.submitted}）` : '';
+    return { text: `已填入（${applied}）：${truncate(current, 200)}${submitted}` };
+  }
+
+  private async upload(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {
+    const target = str(args.target);
+    const selector = str(args.selector);
+    const files = Array.isArray(args.files) ? args.files.filter((item): item is string => typeof item === 'string' && item.trim() !== '') : [];
+    if (!target) return fail('target 是空的：给 browser_open 或 browser_tabs 回的那个 target。');
+    if (!selector) return fail('selector 是空的：给 file input 的 CSS 选择器。');
+    if (files.length === 0) return fail('files 是空的：给要上传的文件的绝对路径。');
+    const notReady = await this.ensureReady();
+    if (notReady) return fail(notReady);
+
+    try {
+      const count = await this.relay.setFiles(target, selector, files, this.timeout(), ctx.signal);
+      return { text: `已给 ${selector} 挂上 ${count} 个文件：${files.join('、')}` };
+    } catch (err) {
+      return fail(this.explain(err, 'upload'));
+    }
+  }
+
+  private async scroll(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {
+    const target = str(args.target);
+    if (!target) return fail('target 是空的：给 browser_open 或 browser_tabs 回的那个 target。');
+    const notReady = await this.ensureReady();
+    if (notReady) return fail(notReady);
+
+    const to = ['down', 'up', 'top', 'bottom'].includes(str(args.to)) ? str(args.to) : 'down';
+    const y = clampInt(args.y, 3000, 0, 1_000_000);
+    try {
+      const said = await this.relay.scroll(target, { direction: to, y }, this.timeout(), ctx.signal);
+      return { text: said || `已滚动（${to}）` };
+    } catch (err) {
+      return fail(this.explain(err, 'scroll'));
+    }
+  }
+
+  private async shot(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {
+    const target = str(args.target);
+    if (!target) return fail('target 是空的：给 browser_open 或 browser_tabs 回的那个 target。');
+    const notReady = await this.ensureReady();
+    if (notReady) return fail(notReady);
+
+    try {
+      const bytes = await this.relay.screenshot(target, this.timeout(), ctx.signal);
+      const info = await this.relay.info(target, this.timeout(), ctx.signal).catch(() => null);
+      const where = info ? `${info.title || '(无标题)'} · ${info.url}` : `target ${target}`;
+      return {
+        text: `截图：${where}\n这是视口那一屏，不是整页；要看更下面的内容先 browser_scroll。`,
+        blobs: [
+          {
+            bytes,
+            mime: 'image/png',
+            name: 'screenshot.png',
+            fallbackText: '页面截图（视口）',
+          },
+        ],
+      };
+    } catch (err) {
+      return fail(this.explain(err, 'screenshot'));
+    }
+  }
+
+  private async navigate(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {
+    const target = str(args.target);
+    if (!target) return fail('target 是空的：给 browser_open 或 browser_tabs 回的那个 target。');
+    const back = args.back === true;
+    const url = str(args.url);
+    if (!back && !url) return fail('url 是空的：给一个要去的地址，或把 back 设成 true。');
+    const notReady = await this.ensureReady();
+    if (notReady) return fail(notReady);
+
+    try {
+      if (back) await this.relay.back(target, this.timeout(), ctx.signal);
+      else await this.relay.navigate(target, withScheme(url), this.timeout(), ctx.signal);
+      const info = await this.relay.info(target, this.timeout(), ctx.signal).catch(() => null);
+      const where = info ? `${info.title || '(无标题)'} · ${info.url}（${info.ready}）` : '页面已响应';
+      return { text: `${back ? '已后退' : '已导航'}：${where}` };
+    } catch (err) {
+      return fail(this.explain(err, 'navigate'));
+    }
+  }
+
+  private async tabs(): Promise<ToolOutcome> {
+    const notReady = await this.ensureReady();
+    if (notReady) return fail(notReady);
+    let targets: PageTarget[];
+    try {
+      targets = await this.relay.targets(this.timeout());
+    } catch (err) {
+      return fail(this.explain(err, 'tabs'));
+    }
+    if (targets.length === 0) return { text: '浏览器里现在没有打开的页面。' };
+    const lines = targets.map((target) => {
+      const mine = this.mine.has(target.targetId) ? '（我开的）' : '';
+      return `- ${target.title || '(无标题)'}${mine}\n  ${target.url}\n  target: ${target.targetId}`;
+    });
+    return { text: [`浏览器里现在有 ${targets.length} 个页面：`, ...lines].join('\n') };
+  }
+
+  private async close(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {
+    const target = str(args.target);
+    if (!target) return fail('target 是空的：给 browser_open 回的那个 target。');
+    if (!this.mine.has(target)) {
+      return fail(
+        `这个页面不是我开的，不关：${target}。` +
+          '他自己开的页面里可能有没保存的东西。要我关请先用 browser_open 打开它。',
+      );
+    }
+    const notReady = await this.ensureReady();
+    if (notReady) return fail(notReady);
+
+    try {
+      await this.relay.close(target, this.timeout(), ctx.signal);
+    } catch (err) {
+      return fail(this.explain(err, 'close'));
+    }
+    this.mine.delete(target);
+    this.seen.delete(target);
+    return { text: `已关闭 ${target}。` };
+  }
+
+  private async findUrl(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {
+    const skillDir = this.opts.cfg.skillDir.trim();
+    if (!skillDir) return fail('worlds.browser.skillDir 没配：找不到 find-url.mjs。');
+    if (!existsSync(join(skillDir, 'scripts', 'find-url.mjs'))) {
+      return fail(`${skillDir}\\scripts 里没有 find-url.mjs：这个工具要 web-access 2.5.0 起才带。`);
+    }
+    const argv: string[] = [];
+    if (Array.isArray(args.keywords)) {
+      for (const word of args.keywords) {
+        if (typeof word === 'string' && word.trim() !== '') argv.push(word.trim());
+      }
+    }
+    const only = str(args.only);
+    if (only === 'bookmarks' || only === 'history') argv.push('--only', only);
+    const browser = str(args.browser);
+    if (browser === 'chrome' || browser === 'edge') argv.push('--browser', browser);
+    if (typeof args.limit === 'number' && Number.isFinite(args.limit)) argv.push('--limit', String(Math.round(args.limit)));
+    const since = str(args.since);
+    if (since) argv.push('--since', since);
+    const sort = str(args.sort);
+    if (sort === 'recent' || sort === 'visits') argv.push('--sort', sort);
+
+    // 这个脚本要看他的书签库与历史库，跟页面无关，所以不走 proxy 的请求超时。
+    ctx.signal?.throwIfAborted();
+    const result = await runFindUrl(skillDir, argv, FIND_URL_TIMEOUT_MS);
+    if (!result.ok) return fail(`书签历史检索没成功：\n${truncate(result.output, 2000)}`);
+    return { text: result.output.trim() || '没有匹配的书签或历史记录。' };
+  }
+
+  // ——— 读页 ———
+
+  /** 读一个页面。失败时给出一句能放进回执的话。 */
+  private async dump(
+    target: string,
+    selector: string | null,
+    maxChars: number,
+    ctx: ToolCallContext,
+  ): Promise<{ ok: true; page: PageDump } | { ok: false; text: string }> {
+    let result: EvalResult;
+    try {
+      result = await this.relay.evaluate(target, readExpression(selector, maxChars), this.timeout(), ctx.signal);
+    } catch (err) {
+      return { ok: false, text: this.explain(err, 'read') };
+    }
+    if (!result.ok) return { ok: false, text: `读这个页面时页面里抛了错：\n${truncate(result.error, 2000)}` };
+    const page = result.value as Partial<PageDump> | null;
+    if (!page || typeof page !== 'object') return { ok: false, text: '读回来的不是页面内容。' };
+    if (typeof page.error === 'string') return { ok: false, text: `没读到：${page.error}` };
+    return {
+      ok: true,
+      page: {
+        title: typeof page.title === 'string' ? page.title : '',
+        url: typeof page.url === 'string' ? page.url : '',
+        ready: typeof page.ready === 'string' ? page.ready : '',
+        text: typeof page.text === 'string' ? page.text : '',
+        links: Array.isArray(page.links) ? page.links.filter(isLink) : [],
+        truncated: page.truncated === true,
+      },
+    };
+  }
+
+  private explain(err: unknown, what: string): string {
+    if (err instanceof RelayError) {
+      const status = err.status;
+      const hint =
+        status === 0
+          ? ` ${this.connectHint()}`
+          : '';
+      return `${what} 没成功（${status || '连接'}）：${err.message}${hint}`;
+    }
+    return `${what} 没成功：${describe(err)}`;
+  }
+}
+
+// ——— 模块级小工具 ———
+
+function renderPage(page: PageDump, maxChars: number): string {
+  const head = `页面：${page.title || '(无标题)'}\n地址：${page.url}（${page.ready}）`;
+  const body = page.text
+    ? `正文${page.truncated ? `（被截到 ${maxChars} 字，要更多就再读一次并指定选择器）` : ''}：\n${page.text}`
+    : '正文是空的：这一页的内容大概都在图片、画布或视频里，用 browser_shot 看一眼。';
+  const links = page.links.length > 0
+    ? `链接（${page.links.length} 条）：\n${page.links
+        .slice(0, LINKS_SHOWN)
+        .map((link) => `- ${truncate(link.text, 60)} → ${link.url}`)
+        .join('\n')}`
+    : '';
+  return [head, body, links].filter((part) => part !== '').join('\n');
+}
+
+function renderValue(value: unknown, maxChars: number): string {
+  if (typeof value === 'string') return truncate(value, maxChars);
+  if (value === undefined) return '(undefined)';
+  try {
+    return truncate(JSON.stringify(value, null, 2) ?? String(value), maxChars);
+  } catch {
+    return truncate(String(value), maxChars);
+  }
+}
+
+function isLink(item: unknown): item is { text: string; url: string } {
+  return typeof item === 'object' && item !== null
+    && typeof (item as { url?: unknown }).url === 'string';
+}
+
+/** 域名 + 标题，给事件正文用。都不存在时退到 URL 本身。 */
+function labelOf(page: SeenPage): string {
+  const site = siteOf(page.url);
+  const title = page.title.trim();
+  if (site && title) return truncate(`${site}「${title}」`, 100);
+  return truncate(title || site || page.url, 100);
+}
+
+function siteOf(url: string): string {
+  try {
+    const parsed = new URL(url);
+    return parsed.host || parsed.protocol.replace(':', '');
+  } catch {
+    return url.slice(0, 60);
+  }
+}
+
+/** 没写协议的补 https://：不然浏览器拿到的是相对地址。 */
+function withScheme(url: string): string {
+  return /^[a-z][a-z0-9+.-]*:/i.test(url) ? url : `https://${url}`;
+}
+
+function displayBrowser(id: string): string {
+  switch (id.trim().toLowerCase()) {
+    case 'chrome':
+      return 'Chrome';
+    case 'edge':
+      return 'Edge';
+    case 'chromium':
+      return 'Chromium';
+    default:
+      return id.trim();
+  }
+}
+
+function str(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function clampInt(value: unknown, fallback: number, min: number, max: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return fallback;
+  return Math.min(max, Math.max(min, Math.round(value)));
+}
+
+function truncate(value: string, maxChars: number): string {
+  if (value.length <= maxChars) return value;
+  return `${value.slice(0, maxChars)}\n…（还有 ${value.length - maxChars} 字没显示）`;
+}
+
+function fail(message: string): ToolOutcome {
+  return { text: `[browser] ${message}`, failed: true };
+}
+
+function describe(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
