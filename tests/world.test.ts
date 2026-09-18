@@ -154,7 +154,7 @@ async function fakeProxy(): Promise<FakeProxy> {
 /** 一个指向假 proxy 的部署上下文。 */
 function contextAt(port: number, patch: Partial<BrowserConfigSection> = {}) {
   const ctx = fakeWorldContext(BROWSER, { scratchDir });
-  ctx.persist({ browser: 'chrome', port, pollIntervalMs: 1000, ...patch });
+  ctx.persist({ browser: 'chrome', port, ...patch });
   return ctx;
 }
 
@@ -249,11 +249,9 @@ describe('Browser World', () => {
     }
   });
 
-  it('环境提示词报两个占位符值：浏览器名与动向开关', () => {
+  it('环境提示词报占位符值：浏览器名', () => {
     const world = startedWorld(3456, { browser: 'edge' });
-    expect(world.envPromptVars()).toEqual({ 'browser.label': 'Edge', 'browser.watching': '会' });
-    const off = startedWorld(3456, { watchActivity: false });
-    expect(off.envPromptVars()['browser.watching']).toBe('不会');
+    expect(world.envPromptVars()).toEqual({ 'browser.label': 'Edge' });
   });
 
   it('没有子进程时 stop() 是空操作', async () => {
@@ -597,94 +595,94 @@ describe('Browser World', () => {
     });
   });
 
-  describe('他的上网动向', () => {
-    it('他新开的页面攒成一条延迟渲染项，piggyback 投递，渲染过就不再来', async () => {
+  describe('他此刻在干什么（拉取式：她问才看）', () => {
+    it('第一回看只列页面，没有变化段', async () => {
       const proxy = await fakeProxy();
-      proxy.pages = [{ targetId: 'HIS1', url: 'https://example.com/a', title: '甲' }];
-      const world = startedWorld(proxy.port, { skillDir: scratchDir });
-      const host = new FakeHost();
-      await world.start(host);
-
-      await sleep(1400); // 第一次快照只打底
-      expect(host.deferred).toHaveLength(0);
-
       proxy.pages = [
-        { targetId: 'HIS1', url: 'https://example.com/a', title: '甲（改过标题）' },
-        { targetId: 'HIS2', url: 'https://github.com/x/pulls', title: '拉取请求' },
+        { targetId: 'HIS1', url: 'https://example.com/a', title: '甲' },
+        { targetId: 'HIS2', url: 'https://github.com/x', title: '拉取请求' },
       ];
-      await sleep(1400);
+      const world = startedWorld(proxy.port, { skillDir: scratchDir });
+      await world.start(new FakeHost());
 
-      expect(host.deferred).toHaveLength(1);
-      expect(host.deferred[0].spec.type).toBe('browser.activity');
-      expect(host.deferred[0].trigger).toBe('piggyback');
-
-      const [line] = await host.renderDeferred();
-      expect(line).toContain('github.com');
-      expect(line).toContain('拉取请求');
-      expect(line).toContain('example.com');
-      expect(await host.renderDeferred()).toEqual([]); // 没有新内容就什么都不落
+      const out = await call(world, 'browser_tabs');
+      expect(out.text).toContain('浏览器里现在有 2 个页面');
+      expect(out.text).toContain('拉取请求');
+      expect(out.text).not.toContain('[变化]');
     });
 
-    it('她自己开的页面不进动向', async () => {
+    it('他开了、转了、关掉之后，第二回看带出净变化', async () => {
+      const proxy = await fakeProxy();
+      proxy.pages = [
+        { targetId: 'HIS1', url: 'https://example.com/a', title: '甲' },
+        { targetId: 'HIS2', url: 'https://example.com/b', title: '乙' },
+      ];
+      const world = startedWorld(proxy.port, { skillDir: scratchDir });
+      await world.start(new FakeHost());
+      await call(world, 'browser_tabs');
+
+      // 他：把甲那页转到别的地址，把乙关掉，又新开一页。
+      proxy.pages = [
+        { targetId: 'HIS1', url: 'https://example.com/a2', title: '甲改' },
+        { targetId: 'HIS3', url: 'https://bilibili.com/v/x', title: '视频' },
+      ];
+      const out = await call(world, 'browser_tabs');
+      expect(out.text).toContain('[变化] 距你上次看');
+      expect(out.text).toContain('转到 example.com「甲改」');
+      expect(out.text).toContain('打开 bilibili.com「视频」');
+      expect(out.text).toContain('关掉 example.com「乙」');
+    });
+
+    it('中间那一段没在采样：变化是两次查看之间的净变化', async () => {
       const proxy = await fakeProxy();
       const world = startedWorld(proxy.port, { skillDir: scratchDir });
-      const host = new FakeHost();
-      await world.start(host);
+      await world.start(new FakeHost());
+      await call(world, 'browser_tabs');
 
-      await sleep(1400); // 打底
-      await call(world, 'browser_open', { url: 'example.com/mine' });
-      await sleep(1400);
-      expect(host.deferred).toHaveLength(0);
+      // 他开了一个又关掉，全程夹在两次查看之间。
+      proxy.pages = [{ targetId: 'TMP', url: 'https://example.com/tmp', title: '一闪而过' }];
+      await call(world, 'browser_tabs'); // 这一回会报「打开」
+      proxy.pages = [];
+      const out = await call(world, 'browser_tabs');
+      expect(out.text).toContain('关掉 example.com「一闪而过」');
     });
 
-    it('wakeOnActivity 打开时改用 debounce', async () => {
+    it('她自己开的页面不算他的变化', async () => {
       const proxy = await fakeProxy();
-      const world = startedWorld(proxy.port, { skillDir: scratchDir, wakeOnActivity: true });
-      const host = new FakeHost();
-      await world.start(host);
+      const world = startedWorld(proxy.port, { skillDir: scratchDir });
+      await world.start(new FakeHost());
+      await call(world, 'browser_tabs');
 
-      await sleep(1400);
-      proxy.pages = [{ targetId: 'HIS1', url: 'https://example.com/a', title: '甲' }];
-      await sleep(1400);
-      expect(host.deferred[0]?.trigger).toBe('debounce');
+      await call(world, 'browser_open', { url: 'example.com/mine' });
+      const out = await call(world, 'browser_tabs');
+      expect(out.text).toContain('（我开的）');
+      expect(out.text).not.toContain('[变化]');
     });
 
-    it('重启后第一轮快照只打底，不把已经开着的页面当成新动向', async () => {
+    it('浏览器的内部页面只在列表里，不进变化段', async () => {
+      const proxy = await fakeProxy();
+      const world = startedWorld(proxy.port, { skillDir: scratchDir });
+      await world.start(new FakeHost());
+      await call(world, 'browser_tabs');
+
+      proxy.pages = [{ targetId: 'NEWTAB', url: 'chrome://newtab/', title: '新标签页' }];
+      const out = await call(world, 'browser_tabs');
+      expect(out.text).toContain('新标签页');
+      expect(out.text).not.toContain('[变化]');
+    });
+
+    it('重启后的第一回看只打底，不把已经开着的页面当成他的变化', async () => {
       const proxy = await fakeProxy();
       proxy.pages = [{ targetId: 'HIS1', url: 'https://example.com/a', title: '甲' }];
       const world = startedWorld(proxy.port, { skillDir: scratchDir });
       await world.start(new FakeHost());
-      await sleep(1400);
+      await call(world, 'browser_tabs');
       await world.stop();
 
-      const second = new FakeHost();
-      await world.start(second);
-      await sleep(1400);
-      expect(second.deferred).toHaveLength(0);
-    });
-
-    it('关掉 watchActivity 就不攒动向', async () => {
-      const proxy = await fakeProxy();
-      const world = startedWorld(proxy.port, { skillDir: scratchDir, watchActivity: false });
-      const host = new FakeHost();
-      await world.start(host);
-
-      await sleep(1400);
-      proxy.pages = [{ targetId: 'HIS1', url: 'https://example.com/a', title: '甲' }];
-      await sleep(1400);
-      expect(host.deferred).toHaveLength(0);
-    });
-
-    it('浏览器的内部页面不算动向', async () => {
-      const proxy = await fakeProxy();
-      const world = startedWorld(proxy.port, { skillDir: scratchDir });
-      const host = new FakeHost();
-      await world.start(host);
-
-      await sleep(1400);
-      proxy.pages = [{ targetId: 'NEWTAB', url: 'chrome://newtab/', title: '新标签页' }];
-      await sleep(1400);
-      expect(host.deferred).toHaveLength(0);
+      await world.start(new FakeHost());
+      const out = await call(world, 'browser_tabs');
+      expect(out.text).toContain('甲');
+      expect(out.text).not.toContain('[变化]');
     });
   });
 });

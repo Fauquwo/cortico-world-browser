@@ -4,7 +4,7 @@ Owner: `src/definition.ts`
 
 把本机 [web-access](https://github.com/eze-is/web-access) 的 CDP proxy 接成一个 World：
 bot 能在操作员自己那个浏览器里开页、读页、点击、填表、上传、滚动、截图，能查本机的书签与历史，
-并且看得见他自己在浏览器里去了哪儿（开了哪个页面、转到哪个站、关掉了什么）。
+想知道他在浏览器里干什么时也能自己看一眼（拉取式，见下面的「事件」）。
 
 浏览器带着他所有网站的登录态。`browser_close` 只接受 bot 自己开的页面——关掉他自己开着的页面
 是不可逆的，机械上就该拦。
@@ -16,7 +16,7 @@ bot 能在操作员自己那个浏览器里开页、读页、点击、填表、�
 | `src/world.ts` | `World` 实现：起停、轮询他的动向、十二个工具、`console()` |
 | `src/cdp-client.ts` | cdp-proxy 的客户端：起停子进程、HTTP 调用、`find-url.mjs` |
 | `src/page-scripts.ts` | 注入页面执行的 JS：读页（穿 Shadow DOM 与 iframe）、填表 |
-| `src/ENV_PROMPT.md` | 环境提示词模板，占位符 `{{browser.label}}` 与 `{{browser.watching}}` |
+| `src/ENV_PROMPT.md` | 环境提示词模板，占位符 `{{browser.label}}` |
 | `scripts/smoke.ts` | 开发用冒烟：对着真的 proxy 走一遍开页、读页、截图 |
 | `tests/` | 干装载、起停、工具回执、动向聚合；假 proxy 是一个真的 HTTP 服务 |
 
@@ -38,9 +38,11 @@ bot 能在操作员自己那个浏览器里开页、读页、点击、填表、�
 
 ## 事件
 
-- `browser.ready` / `browser.down`：内部事件，`flush`，服务起停与掉线恢复。
-- `browser.activity`：他自己在浏览器里的动向。每 `pollIntervalMs` 取一次页面快照取差，
-  只报不是 bot 自己开的那些，攒成一段用延迟渲染投递。默认 `piggyback`——**不叫醒她**，
-  等她下一次开口时随那批事件进上下文；想让她当场就知道，把 `wakeOnActivity` 打开。
+只有两条，都是服务状态：`browser.ready` / `browser.down`（内部事件，`flush`）。
+
+**他自己在浏览器里干什么，是拉取式的，不是推的。** World 不做任何定时采样，也不往事件队列里
+塞东西。bot 想知道的时候调一次 `browser_tabs`：回执给出此刻开着的页面，外加**自它上次调用以来**
+他新开、转到、关掉的页面（净变化）。中间开了又关的不留痕——那段时间没人在看，这是「她问才看」
+必然的代价，写进工具说明了。
 
 设计决定与理由见工作区的 `state/design/cortico-world-browser.md`。

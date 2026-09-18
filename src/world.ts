@@ -12,7 +12,6 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type {
-  Logger,
   ToolCallContext,
   ToolDef,
   ToolOutcome,
@@ -37,23 +36,20 @@ const READ_TEXT_MAX = 40000;
 const LINKS_SHOWN = 20;
 /** `browser_js` 回执里值序列化之后的上限。 */
 const JS_VALUE_MAX = 30000;
-/** 一次动向回执最多列几条，以及环形队列的容量。 */
-const ACTIVITY_LINES_MAX = 12;
-const ACTIVITY_KEEP = 40;
-/** 连续取不到快照多少次才认定掉线；一次网络抖动不算。 */
-const POLL_FAILURES_BEFORE_DOWN = 2;
+/** `browser_tabs` 的变化段最多列几条。 */
+const CHANGES_MAX = 12;
 /** 等就绪的轮询间隔。 */
 const READY_POLL_MS = 1000;
 /** `find-url.mjs` 跑一次的上限：它要开本机的 sqlite 历史库。 */
 const FIND_URL_TIMEOUT_MS = 20000;
 
-/** 浏览器的内部页面不进动态：那不是「他去了哪儿」。 */
+/** 浏览器的内部页面不进变化段：那不是「他去了哪儿」。 */
 const INTERNAL_URL = /^(chrome|edge|brave|about|devtools|chrome-extension|extension|chrome-untrusted):/i;
 
-const KIND_VERB: Record<ActivityEntry['kind'], string> = { opened: '打开', moved: '转到', closed: '关掉' };
+const KIND_VERB: Record<PageChange['kind'], string> = { opened: '打开', moved: '转到', closed: '关掉' };
 
-interface ActivityEntry {
-  ts: string;
+/** 两次查看之间，一个页面发生的变化。 */
+interface PageChange {
   kind: 'opened' | 'moved' | 'closed';
   label: string;
 }
@@ -92,13 +88,13 @@ export class BrowserWorld implements World {
   private browserLabel = '';
   /** 自己开的页面；只有这些允许关。 */
   private readonly mine = new Set<string>();
-  /** 上一次快照：targetId → 页面。 */
+  /**
+   * 上一次 `browser_tabs` 看到的页面：targetId → 页面，加一个看的时间。
+   * 只在被她问的时候更新——这个 World 自己不定时看任何东西。
+   */
   private readonly seen = new Map<string, SeenPage>();
-  private primed = false;
-  private activity: ActivityEntry[] = [];
-  private activityArmed = false;
-  private pollTimer: NodeJS.Timeout | null = null;
-  private pollFailures = 0;
+  private seenAt = 0;
+  /** proxy 掉了之后补拉过一次就不再试了。 */
   private recoveryTried = false;
 
   constructor(private readonly opts: BrowserWorldOptions) {
@@ -111,12 +107,9 @@ export class BrowserWorld implements World {
     });
   }
 
-  /** 模板里的两个占位符：操作哪个浏览器、他的上网动向报不报。 */
+  /** 模板里的占位符：她操作的是哪个浏览器。 */
   envPromptVars(): Record<string, string> {
-    return {
-      'browser.label': displayBrowser(this.opts.cfg.browser),
-      'browser.watching': this.opts.cfg.watchActivity ? '会' : '不会',
-    };
+    return { 'browser.label': displayBrowser(this.opts.cfg.browser) };
   }
 
   console(): WorldConsoleDecl {
@@ -136,10 +129,7 @@ export class BrowserWorld implements World {
           description: '这个浏览器这一段进 system 前缀的说明；留空则该 World 不进入前缀。',
           path: ENV_PROMPT_FILE,
           role: 'envPrompt',
-          vars: [
-            { name: 'browser.label', description: '当前配置要操作的浏览器。' },
-            { name: 'browser.watching', description: '他的上网动向此刻会不会进上下文。' },
-          ],
+          vars: [{ name: 'browser.label', description: '当前配置要操作的浏览器。' }],
         },
       ],
     };
@@ -160,7 +150,6 @@ export class BrowserWorld implements World {
             'browser.ready',
             `浏览器已就绪（复用了已在运行的 proxy，${this.relay.endpoint()}，${this.browserLabel || '浏览器未识别'}）。`,
           );
-          this.startPolling(log);
           return;
         }
         // 端口上已经有 proxy 了，但浏览器没接上。不再拉起一个去抢端口。
@@ -168,7 +157,6 @@ export class BrowserWorld implements World {
         this.lastError = '已经有一个 proxy 在跑，但它没连上浏览器';
         log.warn('复用的 proxy 没连上浏览器');
         await this.emit('browser.down', `浏览器不可用：${this.lastError}。${this.connectHint()}`);
-        this.startPolling(log);
         return;
       }
 
@@ -192,13 +180,11 @@ export class BrowserWorld implements World {
         this.lastError = this.relay.failure || '等它连上浏览器超时';
         log.warn('cdp-proxy 没能连上浏览器', { error: this.lastError });
         await this.emit('browser.down', `浏览器没能就绪：${this.lastError}。${this.connectHint()}`);
-        this.startPolling(log);
         return;
       }
       this.state = 'ready';
       log.info('浏览器已就绪', { endpoint: this.relay.endpoint(), browser: this.browserLabel });
       await this.emit('browser.ready', `浏览器已就绪（${this.relay.endpoint()}，${this.browserLabel || displayBrowser(this.opts.cfg.browser)}）。`);
-      this.startPolling(log);
     } catch (err) {
       this.state = 'failed';
       this.lastError = describe(err);
@@ -208,19 +194,11 @@ export class BrowserWorld implements World {
 
   async stop(): Promise<void> {
     this.running = false;
-    if (this.pollTimer) {
-      clearInterval(this.pollTimer);
-      this.pollTimer = null;
-    }
     await this.relay.stop(); // 只关自己拉起的那个
     this.state = 'idle';
     this.host = null;
-    this.activity = [];
-    this.activityArmed = false;
-    // 下一次 start 的第一轮快照只打底：否则已经开着的页面会被当成刚打开。
     this.seen.clear();
-    this.primed = false;
-    this.pollFailures = 0;
+    this.seenAt = 0;
     this.recoveryTried = false;
   }
 
@@ -236,47 +214,42 @@ export class BrowserWorld implements World {
     return false;
   }
 
-  /** 轮询同时兜着两件事：他的动向，以及「掉线之后又回来了」。 */
-  private startPolling(log: Logger): void {
-    if (this.pollTimer) return;
-    const interval = Math.max(1000, this.opts.cfg.pollIntervalMs);
-    this.pollTimer = setInterval(() => void this.poll(log), interval);
-    this.pollTimer.unref();
+  /**
+   * 与她上次问的时候比：他新开了、转到、关掉了哪些页面。
+   *
+   * 这个 World 自己**不定时看任何东西**——她想知道他在干什么，调一次 `browser_tabs` 就是问一次。
+   * 因此报的是「自你上次看以来」的净变化：中间开了又关的页面看不见，那不是做不到，是没在采样。
+   */
+  private collectChanges(targets: readonly PageTarget[]): { changes: PageChange[]; sinceMs: number } {
+    const first = this.seenAt === 0;
+    const changes: PageChange[] = [];
+    const present = new Set<string>();
+    for (const target of targets) {
+      present.add(target.targetId);
+      const previous = this.seen.get(target.targetId);
+      if (previous && previous.url === target.url && previous.title === target.title) continue;
+      this.seen.set(target.targetId, { url: target.url, title: target.title });
+      // 第一次看没有可比的东西；她自己开的页面不是他的动向。
+      if (first || this.mine.has(target.targetId) || INTERNAL_URL.test(target.url)) continue;
+      changes.push({ kind: previous ? 'moved' : 'opened', label: labelOf({ url: target.url, title: target.title }) });
+    }
+    for (const [targetId, page] of [...this.seen]) {
+      if (present.has(targetId)) continue;
+      this.seen.delete(targetId);
+      if (first || this.mine.has(targetId) || INTERNAL_URL.test(page.url)) continue;
+      changes.push({ kind: 'closed', label: labelOf(page) });
+    }
+    const sinceMs = this.seenAt === 0 ? 0 : Date.now() - this.seenAt;
+    this.seenAt = Date.now();
+    return { changes, sinceMs };
   }
 
-  private async poll(log: Logger): Promise<void> {
-    if (!this.running) return;
-    let targets: PageTarget[];
-    try {
-      targets = await this.relay.targets(this.timeout());
-    } catch (err) {
-      this.pollFailures += 1;
-      if (this.pollFailures === POLL_FAILURES_BEFORE_DOWN) {
-        const reason = describe(err);
-        log.warn('取不到浏览器快照', { err: reason });
-        if (this.state === 'ready') {
-          this.state = 'failed';
-          this.lastError = reason;
-          await this.emit('browser.down', `浏览器不可用了：${reason}。${this.connectHint()}`);
-        }
-        void this.maybeRelaunch(log);
-      }
-      return;
-    }
-    this.pollFailures = 0;
-    this.recoveryTried = false;
-    if (this.state !== 'ready') {
-      this.state = 'ready';
-      this.lastError = '';
-      await this.emit('browser.ready', `浏览器又连上了（${this.relay.endpoint()}）。`);
-    }
-    this.diff(targets);
-  }
-
-  /** proxy 死了不会自己回来。整场只补拉一次，避免对着关掉的浏览器反复拉起。 */
-  private async maybeRelaunch(log: Logger): Promise<void> {
-    if (this.recoveryTried || this.relay.owned || !this.opts.cfg.skillDir.trim()) return;
+  /** proxy 死了不会自己回来，而没有定时器在替我们看着。整场只补拉一次。 */
+  private async tryRelaunch(): Promise<void> {
+    const host = this.host;
+    if (!host || this.recoveryTried || this.relay.owned || !this.opts.cfg.skillDir.trim()) return;
     this.recoveryTried = true;
+    const log = host.log.child(this.id);
     const portProblem = await this.relay.checkPort();
     if (portProblem) {
       log.warn('端口用不了，不补拉了', { error: portProblem });
@@ -284,70 +257,10 @@ export class BrowserWorld implements World {
     }
     log.info('proxy 不在了，补拉一次');
     if (!this.relay.spawnProxy(log)) return;
-    if (!(await this.waitReady(this.opts.cfg.readyTimeoutMs))) log.warn('补拉的 proxy 也没能连上浏览器');
-  }
-
-  /** 与上一次快照取差。只报不是她自己开的那几个页面。 */
-  private diff(targets: readonly PageTarget[]): void {
-    const changes: ActivityEntry[] = [];
-    const present = new Set<string>();
-    for (const target of targets) {
-      if (INTERNAL_URL.test(target.url)) continue;
-      present.add(target.targetId);
-      const previous = this.seen.get(target.targetId);
-      if (previous && previous.url === target.url && previous.title === target.title) continue;
-      this.seen.set(target.targetId, { url: target.url, title: target.title });
-      if (!this.primed || this.mine.has(target.targetId)) continue;
-      changes.push({
-        ts: nowIso(this.opts.timezone),
-        kind: previous ? 'moved' : 'opened',
-        label: labelOf({ url: target.url, title: target.title }),
-      });
+    // 这是在一次工具调用里等，别把调用本身拖到超时。
+    if (!(await this.waitReady(Math.min(4000, this.opts.cfg.readyTimeoutMs)))) {
+      log.warn('补拉的 proxy 也没能连上浏览器');
     }
-    for (const [targetId, page] of [...this.seen]) {
-      if (present.has(targetId)) continue;
-      this.seen.delete(targetId);
-      if (!this.primed || this.mine.has(targetId)) continue;
-      changes.push({ ts: nowIso(this.opts.timezone), kind: 'closed', label: labelOf(page) });
-    }
-    this.primed = true;
-    if (changes.length > 0 && this.opts.cfg.watchActivity) this.noteActivity(changes);
-  }
-
-  /**
-   * 攒着，用延迟渲染投一条。
-   *
-   * `piggyback` 不触发计时、不参与外部事件计数，所以他刷一天网页也不会把她叫起来烧钱——
-   * 等他开口时，这一段才随那批事件进上下文。想让她当场就知道，把 `wakeOnActivity` 打开。
-   */
-  private noteActivity(entries: readonly ActivityEntry[]): void {
-    this.activity.push(...entries);
-    const extra = this.activity.length - ACTIVITY_KEEP;
-    if (extra > 0) this.activity.splice(0, extra);
-    const host = this.host;
-    if (!host || this.activityArmed) return;
-    this.activityArmed = true;
-    host.pushDeferred(
-      {
-        type: 'browser.activity',
-        tags: ['snapshot'],
-        render: () => {
-          this.activityArmed = false;
-          return this.renderActivity();
-        },
-      },
-      { trigger: this.opts.cfg.wakeOnActivity ? 'debounce' : 'piggyback' },
-    );
-  }
-
-  private renderActivity(): string | null {
-    if (this.activity.length === 0) return null;
-    const entries = this.activity.splice(0, this.activity.length);
-    const shown = entries.slice(-ACTIVITY_LINES_MAX);
-    const lines = shown.map((entry) => `  ${entry.ts.slice(11, 16)} ${KIND_VERB[entry.kind]} ${entry.label}`);
-    const head = `[浏览器动向] 他刚在${this.browserLabel || displayBrowser(this.opts.cfg.browser) || '浏览器'}里：`;
-    const tail = entries.length > shown.length ? `  （另有 ${entries.length - shown.length} 条更早的）` : null;
-    return [head, ...lines, tail].filter((line): line is string => line !== null).join('\n');
   }
 
   private lamp(): WorldLamp {
@@ -395,9 +308,18 @@ export class BrowserWorld implements World {
     return Math.max(3000, this.opts.cfg.requestTimeoutMs);
   }
 
-  /** 工具调用前的现查：状态可能是陈旧的，先探一次再决定要不要报不可用。 */
+  /**
+   * 工具调用前的现查：状态可能是陈旧的，先探一次；还是不通就顺手补拉一次 proxy，
+   * 再不通才报不可用。没有定时器在替她看着，所以补拉挂在这一条路上。
+   */
   private async ensureReady(): Promise<string | null> {
     if (this.state === 'ready') return null;
+    if (await this.relay.reachable(this.timeout())) {
+      this.state = 'ready';
+      this.lastError = '';
+      return null;
+    }
+    await this.tryRelaunch();
     if (await this.relay.reachable(this.timeout())) {
       this.state = 'ready';
       this.lastError = '';
@@ -626,7 +548,10 @@ export class BrowserWorld implements World {
     return {
       name: 'browser_tabs',
       description:
-        'List the pages open in the browser right now: what the operator has open and what you opened. ' +
+        'List the pages open in the browser right now — what the operator has open and what you opened — plus what ' +
+        'changed since the previous call: the pages he opened, moved or closed in between. Changes are net between ' +
+        'two calls, so a page he opened and closed in between leaves no trace, and the browser\'s own pages ' +
+        '(chrome://…) never appear in them. ' +
         'Each entry is marked `mine: true` when you opened it — those are the only ones `browser_close` accepts.',
       tags: ['read', 'snapshot'],
       parameters: { type: 'object', additionalProperties: false, properties: {} },
@@ -869,12 +794,13 @@ export class BrowserWorld implements World {
     } catch (err) {
       return fail(this.explain(err, 'tabs'));
     }
-    if (targets.length === 0) return { text: '浏览器里现在没有打开的页面。' };
+    const { changes, sinceMs } = this.collectChanges(targets);
+    const head = targets.length === 0 ? '浏览器里现在没有打开的页面。' : `浏览器里现在有 ${targets.length} 个页面：`;
     const lines = targets.map((target) => {
       const mine = this.mine.has(target.targetId) ? '（我开的）' : '';
       return `- ${target.title || '(无标题)'}${mine}\n  ${target.url}\n  target: ${target.targetId}`;
     });
-    return { text: [`浏览器里现在有 ${targets.length} 个页面：`, ...lines].join('\n') };
+    return { text: [head, ...lines, renderChanges(changes, sinceMs)].filter((part) => part !== '').join('\n') };
   }
 
   private async close(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {
@@ -989,6 +915,24 @@ function renderPage(page: PageDump, maxChars: number): string {
   return [head, body, links].filter((part) => part !== '').join('\n');
 }
 
+/** 变化那一段：只在他真的动了页面时出现，并且说清是「自你上次看以来」。 */
+function renderChanges(changes: readonly PageChange[], sinceMs: number): string {
+  if (changes.length === 0) return '';
+  const shown = changes.slice(-CHANGES_MAX);
+  const lines = shown.map((change) => `  ${KIND_VERB[change.kind]} ${change.label}`);
+  const when = sinceMs > 0 ? `距你上次看约${elapsedText(sinceMs)}` : '自你上次看';
+  const tail = changes.length > shown.length ? `  （另有 ${changes.length - shown.length} 条更早的）` : null;
+  return [`[变化] ${when}：`, ...lines, tail].filter((line): line is string => line !== null).join('\n');
+}
+
+function elapsedText(ms: number): string {
+  const minutes = Math.round(ms / 60_000);
+  if (minutes < 1) return '不到一分钟';
+  if (minutes < 60) return `${minutes} 分钟`;
+  const hours = Math.round(minutes / 60);
+  return hours < 24 ? `${hours} 小时` : `${Math.round(hours / 24)} 天`;
+}
+
 function renderValue(value: unknown, maxChars: number): string {
   if (typeof value === 'string') return truncate(value, maxChars);
   if (value === undefined) return '(undefined)';
@@ -1004,7 +948,7 @@ function isLink(item: unknown): item is { text: string; url: string } {
     && typeof (item as { url?: unknown }).url === 'string';
 }
 
-/** 域名 + 标题，给事件正文用。都不存在时退到 URL 本身。 */
+/** 域名 + 标题，给变化那一段用。都不存在时退到 URL 本身。 */
 function labelOf(page: SeenPage): string {
   const site = siteOf(page.url);
   const title = page.title.trim();
