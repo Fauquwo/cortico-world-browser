@@ -21,7 +21,7 @@ import type {
   WorldLamp,
 } from 'cortico/core/types.ts';
 import { nowIso } from 'cortico/core/util.ts';
-import { CdpRelay, RelayError, runFindUrl, type EvalResult, type PageTarget } from './cdp-client.ts';
+import { CdpRelay, RelayError, classifyRelayError, runFindUrl, type EvalResult, type PageTarget, type RelayFailureKind } from './cdp-client.ts';
 import { BROWSER_CONFIG_GROUP, type BrowserConfigSection } from './config.ts';
 import { readExpression, typeExpression } from './page-scripts.ts';
 
@@ -42,6 +42,38 @@ const CHANGES_MAX = 12;
 const READY_POLL_MS = 1000;
 /** `find-url.mjs` 跑一次的上限：它要开本机的 sqlite 历史库。 */
 const FIND_URL_TIMEOUT_MS = 20000;
+/**
+ * 导航那一段的下限超时。普通调用超时（`requestTimeoutMs`）默认 30 秒，而站点打不通时上游的
+ * `Page.navigate` 正好要等它自己的 30 秒 CDP 超时才回话——客户端若也卡在 30 秒，拿到的只是本地
+ * 那句 `aborted due to timeout`，真话被挡在外面。宽这 5 秒是为了拿到**上游自己的回答**。
+ */
+const NAV_TIMEOUT_MIN_MS = 35_000;
+/** 导航没成之后，再试读一次那块内容用的短超时：页面那一侧可能还卡着，别把调用再拖长一轮。 */
+const NAV_FAILED_DUMP_MS = 5000;
+
+/**
+ * 这一类失败（导航没在窗口内完成）要说的话。
+ *
+ * 关键是**别让她以为浏览器坏了**：2026-09-30 那天她连着三次 `browser_open example.com` 拿到
+ * 「连不上 cdp-proxy + 去开远程调试」，顺手把「browser 别再试了」写进了自己的笔记——而浏览器
+ * 与 proxy 全程都是好的，打不开的是那个域名。
+ */
+const NAV_UNANSWERED_HINT =
+  '（proxy 与浏览器都是通的：多半是那个地址在这台机器上打不开、或者页面太慢。' +
+  '先确认这个站点连得上，或换个地址再试——不是浏览器坏了。）';
+
+/** 这一类失败（命令发出去没回话）要说的话。 */
+const COMMAND_TIMEOUT_HINT =
+  '（proxy 与浏览器都是通的：是这一发命令没回话，多半那个页面自己卡着。换个页面或过一会儿再试。）';
+
+/** 失败归类在回执里的说法。 */
+const FAILURE_LABEL: Record<RelayFailureKind | 'nav', string> = {
+  unreachable: '连不上 proxy',
+  'not-connected': '浏览器没连上',
+  'command-timeout': '命令没回话',
+  nav: '页面没打开',
+  relay: 'proxy 报错',
+};
 
 /** 浏览器的内部页面不进变化段：那不是「他去了哪儿」。 */
 const INTERNAL_URL = /^(chrome|edge|brave|about|devtools|chrome-extension|extension|chrome-untrusted):/i;
@@ -306,6 +338,11 @@ export class BrowserWorld implements World {
 
   private timeout(): number {
     return Math.max(3000, this.opts.cfg.requestTimeoutMs);
+  }
+
+  /** 导航那一段单独的超时：见 `NAV_TIMEOUT_MIN_MS` 的注释。 */
+  private navTimeout(): number {
+    return Math.max(this.timeout(), NAV_TIMEOUT_MIN_MS);
   }
 
   /**
@@ -611,13 +648,30 @@ export class BrowserWorld implements World {
     const notReady = await this.ensureReady();
     if (notReady) return fail(notReady);
 
+    // ① 先建一个空白 tab：这一步快（本机量过 167 毫秒），而且**拿到 id 就先认下来**——
+    //    后面无论导航成不成，这个页面都认得出、关得掉，不会再留孤儿。
     let targetId: string;
     try {
-      targetId = await this.relay.open(withScheme(raw), this.timeout(), ctx.signal);
+      targetId = await this.relay.openBlank(this.timeout(), ctx.signal);
     } catch (err) {
       return fail(this.explain(err, 'open'));
     }
     this.mine.add(targetId);
+
+    // ② 再单独导航。这一段走 navTimeout()，比普通调用宽：站点打不通时上游要等它自己的 30 秒
+    //    CDP 超时才回话，客户端卡在 30 秒上只会把真话挡在外面。
+    try {
+      await this.relay.navigate(targetId, withScheme(raw), this.navTimeout(), ctx.signal);
+    } catch (err) {
+      const told = this.explain(err, '导航', 'nav');
+      const page = await this.dump(targetId, null, OPEN_TEXT_MAX, ctx, NAV_FAILED_DUMP_MS);
+      return fail(
+        `${told}\n` +
+          `target: ${targetId} 这个页面还开着（多半是那个站点的问题）：你稍后可以再 browser_read 一次，或 browser_close 关掉它。` +
+          (page.ok ? `\n它此刻显示的是：\n${renderPage(page.page, OPEN_TEXT_MAX)}` : ''),
+      );
+    }
+
     const page = await this.dump(targetId, null, OPEN_TEXT_MAX, ctx);
     if (!page.ok) return fail(`页面已打开（target ${targetId}），但没能读回内容：${page.text}`);
     return { text: [`已打开（target ${targetId}）。`, renderPage(page.page, OPEN_TEXT_MAX)].join('\n') };
@@ -775,13 +829,13 @@ export class BrowserWorld implements World {
     if (notReady) return fail(notReady);
 
     try {
-      if (back) await this.relay.back(target, this.timeout(), ctx.signal);
-      else await this.relay.navigate(target, withScheme(url), this.timeout(), ctx.signal);
+      if (back) await this.relay.back(target, this.navTimeout(), ctx.signal);
+      else await this.relay.navigate(target, withScheme(url), this.navTimeout(), ctx.signal);
       const info = await this.relay.info(target, this.timeout(), ctx.signal).catch(() => null);
       const where = info ? `${info.title || '(无标题)'} · ${info.url}（${info.ready}）` : '页面已响应';
       return { text: `${back ? '已后退' : '已导航'}：${where}` };
     } catch (err) {
-      return fail(this.explain(err, 'navigate'));
+      return fail(this.explain(err, '导航', 'nav'));
     }
   }
 
@@ -862,10 +916,11 @@ export class BrowserWorld implements World {
     selector: string | null,
     maxChars: number,
     ctx: ToolCallContext,
+    timeoutMs = this.timeout(),
   ): Promise<{ ok: true; page: PageDump } | { ok: false; text: string }> {
     let result: EvalResult;
     try {
-      result = await this.relay.evaluate(target, readExpression(selector, maxChars), this.timeout(), ctx.signal);
+      result = await this.relay.evaluate(target, readExpression(selector, maxChars), timeoutMs, ctx.signal);
     } catch (err) {
       return { ok: false, text: this.explain(err, 'read') };
     }
@@ -886,16 +941,25 @@ export class BrowserWorld implements World {
     };
   }
 
-  private explain(err: unknown, what: string): string {
-    if (err instanceof RelayError) {
-      const status = err.status;
-      const hint =
-        status === 0
-          ? ` ${this.connectHint()}`
-          : '';
-      return `${what} 没成功（${status || '连接'}）：${err.message}${hint}`;
-    }
-    return `${what} 没成功：${describe(err)}`;
+  /**
+   * 一句话解释失败，并按**哪一类**失败决定贴哪段话。
+   *
+   * 教训（2026-09-30）：那段「去开远程调试」原先无条件贴（`status === 0` 就贴），于是「站点打不开」
+   * 被念成「浏览器没连上」——bot 照着自己手里 `browser_tabs` 列得出 25 个页面这一点就矛盾了。
+   * 现在只有「连不上 proxy」与「proxy 说浏览器没连上」才贴它；导航那一段（`step: 'nav'`）另有说法。
+   */
+  private explain(err: unknown, what: string, step: 'plain' | 'nav' = 'plain'): string {
+    if (!(err instanceof RelayError)) return `${what} 没成功：${describe(err)}`;
+    const kind: RelayFailureKind | 'nav' = step === 'nav' ? 'nav' : classifyRelayError(err);
+    const tail =
+      kind === 'unreachable' || kind === 'not-connected'
+        ? ` ${this.connectHint()}`
+        : kind === 'nav'
+          ? ` ${NAV_UNANSWERED_HINT}`
+          : kind === 'command-timeout'
+            ? ` ${COMMAND_TIMEOUT_HINT}`
+            : '';
+    return `${what} 没成功（${FAILURE_LABEL[kind]}）：${err.message}${tail}`;
   }
 }
 

@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { ToolCallContext, ToolOutcome } from 'cortico/core/types.ts';
 import { dryMountWorld, fakeWorldContext } from 'cortico/extensions/dry-mount.ts';
+import { RelayError, classifyRelayError } from '../src/cdp-client.ts';
 import type { BrowserConfigSection } from '../src/config.ts';
 import { BROWSER } from '../src/definition.ts';
 import type { BrowserWorld } from '../src/world.ts';
@@ -39,6 +40,14 @@ interface FakeProxy {
   evalStatus: number | null;
   /** proxy 在跑但浏览器没连上。 */
   browserDown: boolean;
+  /** `/new` 收到的正文（我们只该发 `about:blank`：建 tab 与导航是两步）。 */
+  openBodies: string[];
+  /** `/navigate` 收到的地址。 */
+  navBodies: string[];
+  /** 设了就让 `/navigate` 先拖这么久——用来验导航那一段用的是更宽的超时。 */
+  navDelayMs: number;
+  /** 设了就让 `/navigate` 回这个状态码 + `CDP 命令超时: Page.navigate`（站点打不开的现场）。 */
+  navStatus: number | null;
   evalBodies: string[];
   hits: string[];
   closed: string[];
@@ -52,6 +61,10 @@ async function fakeProxy(): Promise<FakeProxy> {
     evalReply: () => ({ ok: true, value: null }),
     evalStatus: null,
     browserDown: false,
+    openBodies: [],
+    navBodies: [],
+    navDelayMs: 0,
+    navStatus: null,
     evalBodies: [],
     hits: [],
     closed: [],
@@ -92,6 +105,7 @@ async function fakeProxy(): Promise<FakeProxy> {
       }
       if (path === '/new') {
         const target = (await body()).trim();
+        state.openBodies.push(target);
         seq += 1;
         const targetId = `T${seq}`;
         state.pages.push({ targetId, url: target, title: `页面${seq}` });
@@ -131,8 +145,22 @@ async function fakeProxy(): Promise<FakeProxy> {
         res.end(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
         return;
       }
-      if (path === '/navigate' || path === '/back') {
+      if (path === '/navigate') {
+        const to = (await body()).trim();
+        state.navBodies.push(to);
+        if (state.navDelayMs > 0) await sleep(state.navDelayMs);
+        if (state.navStatus !== null) {
+          // 上游在宿主不回话时的原话：Page.navigate 等满它自己的 30 秒 CDP 超时。
+          json({ error: 'CDP 命令超时: Page.navigate' }, state.navStatus);
+          return;
+        }
+        const page = state.pages.find((item) => item.targetId === url.searchParams.get('target'));
+        if (page) page.url = to;
         json({ frameId: 'frame-1' });
+        return;
+      }
+      if (path === '/back') {
+        json({ ok: true });
         return;
       }
       if (path === '/close') {
@@ -385,6 +413,53 @@ describe('Browser World', () => {
       expect(proxy.evalBodies.at(-1)).toContain('shadowRoot');
       expect(proxy.pages[0].url).toBe('https://example.com/a');
     });
+
+    it('browser_open 分两步：先建空白 tab 认出 id，再单独导航', async () => {
+      const proxy = await fakeProxy();
+      proxy.evalReply = () => PAGE_DUMP;
+      const world = startedWorld(proxy.port, { skillDir: scratchDir });
+      await world.start(new FakeHost());
+
+      const out = await call(world, 'browser_open', { url: 'example.com/a' });
+      expect(out.failed).toBeUndefined();
+      // 建 tab 那一步只发 about:blank，地址走 /navigate：两步才认得住 id，孤儿就是这么来的。
+      expect(proxy.openBodies).toEqual(['about:blank']);
+      expect(proxy.navBodies).toEqual(['https://example.com/a']);
+      // 认下来了：她关得掉（失败那一路也认，见下一条）。
+      const closed = await call(world, 'browser_close', { target: 'T1' });
+      expect(closed.failed).toBeUndefined();
+      expect(closed.text).toContain('已关闭');
+    });
+
+    it('站点打不开（上游 CDP 命令超时）：说清哪一类、不贴开关那句，tab 留着且关得掉', async () => {
+      const proxy = await fakeProxy();
+      proxy.navStatus = 500;
+      const world = startedWorld(proxy.port, { skillDir: scratchDir });
+      await world.start(new FakeHost());
+
+      const out = await call(world, 'browser_open', { url: 'example.com' });
+      expect(out.failed).toBe(true);
+      expect(out.text).toContain('页面没打开');
+      expect(out.text).toContain('不是浏览器坏了');
+      expect(out.text).not.toContain('inspect'); // 2026-09-30 那次被带偏的就是这一句
+      expect(out.text).toContain('target: T1'); // 页面还开着、认得出
+
+      const closed = await call(world, 'browser_close', { target: 'T1' });
+      expect(closed.failed).toBeUndefined();
+      expect(closed.text).toContain('已关闭');
+    });
+
+    it('导航那一段用的是更宽的超时：比 requestTimeoutMs 慢的导航仍然成', async () => {
+      const proxy = await fakeProxy();
+      proxy.evalReply = () => PAGE_DUMP;
+      proxy.navDelayMs = 3500; // 普通调用超时是 3000 的下限，导航那一段是 35 秒
+      const world = startedWorld(proxy.port, { skillDir: scratchDir, requestTimeoutMs: 3000 });
+      await world.start(new FakeHost());
+
+      const out = await call(world, 'browser_open', { url: 'example.com/slow' });
+      expect(out.failed).toBeUndefined();
+      expect(out.text).toContain('target T1');
+    }, 15000);
 
     it('browser_read：选择器与字数上限透传进去，正文空时提示去截图', async () => {
       const proxy = await fakeProxy();
@@ -684,5 +759,15 @@ describe('Browser World', () => {
       expect(out.text).toContain('甲');
       expect(out.text).not.toContain('[变化]');
     });
+  });
+});
+
+describe('失败归类（决定回执贴哪句话）', () => {
+  it('认得出四类：命令没回话、连不上 proxy、浏览器没连上、proxy 报的其他错', () => {
+    expect(classifyRelayError(new RelayError('CDP 命令超时: Page.navigate', 500))).toBe('command-timeout');
+    expect(classifyRelayError(new RelayError('连不上 cdp-proxy（http://127.0.0.1:3517）：The operation was aborted due to timeout', 0))).toBe('unreachable');
+    expect(classifyRelayError(new RelayError('Chrome 未开启远程调试端口', 500))).toBe('not-connected');
+    expect(classifyRelayError(new RelayError('WebSocket 未连接', 500))).toBe('not-connected');
+    expect(classifyRelayError(new RelayError('未知端点 /x', 404))).toBe('relay');
   });
 });

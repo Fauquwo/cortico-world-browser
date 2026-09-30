@@ -80,8 +80,11 @@ if (!ok) {
 }
 
 console.log('浏览器已接上，开始走一遍：');
-const target = await relay.open(url, 30000);
+// 与 World 同一条路：先建空白 tab（拿住 id），再单独导航——站点打不开时不至于丢了页面。
+const target = await relay.openBlank(30000);
 console.log(`  开了新页：target=${target}`);
+await relay.navigate(target, url, 35000);
+console.log(`  导航到 ${url}`);
 
 const dump = await relay.evaluate(target, readExpression(null, 1200), 30000);
 if (dump.ok) {
@@ -102,4 +105,4 @@ console.log(`  截图：${shot.length} 字节，写到 ${shotPath}`);
 await relay.close(target, 30000);
 console.log(`  关掉了 ${target}`);
 await relay.stop();
-console.log(relay.owned ? '（proxy 是复用的，没关它）' : '（proxy 是这次拉起的，已关）');
+console.log(relay.owned ? '（proxy 是这次拉起的，已关）' : '（proxy 是复用的，没关它）');

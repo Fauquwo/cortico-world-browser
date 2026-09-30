@@ -44,6 +44,26 @@ export class RelayError extends Error {
   }
 }
 
+/** 失败归类。World 拿它决定该说哪句话；这里只认形状，不写文案。 */
+export type RelayFailureKind = 'unreachable' | 'not-connected' | 'command-timeout' | 'relay';
+
+/**
+ * 把 proxy 的报错归成几类。
+ *
+ * 为什么要分类（2026-09-30 那条诊断）：「连不上 proxy」「命令没回话」「浏览器没连上」原先在
+ * World 那边都贴同一句「去开远程调试」，于是「站点打不开」被念成「浏览器没连上」——bot 照着自己
+ * 手里 `browser_tabs` 列得出 25 个页面这一点，都读出了矛盾。**只有前两类真的与浏览器/开关有关。**
+ *
+ * 顺序有讲究：`CDP 命令超时` 是 proxy 自己报的（HTTP 500，正文里带这句），它的 status 不是 0，
+ * 所以先按正文认出来，别落进「连接」那一档。
+ */
+export function classifyRelayError(err: RelayError): RelayFailureKind {
+  if (/CDP 命令超时/.test(err.message)) return 'command-timeout';
+  if (err.status === 0) return 'unreachable';
+  if (/远程调试|WebSocket 未连接|无法获取|attach 失败/i.test(err.message)) return 'not-connected';
+  return 'relay';
+}
+
 export interface CdpRelayOptions {
   /** web-access 目录：`scripts/cdp-proxy.mjs` 在这里。 */
   skillDir: string;
@@ -244,11 +264,19 @@ export class CdpRelay {
       .filter((target) => target.targetId !== '');
   }
 
-  /** 新建后台 tab，等它加载完，返回 targetId。 */
-  async open(url: string, timeoutMs: number, signal?: AbortSignal): Promise<string> {
+  /**
+   * 新建一个**空白**后台 tab，返回 targetId。
+   *
+   * 为什么不把地址交给 `/new`：上游的 `/new` 是「建 tab → 导航 → 等加载」一条龙，宿主打不开时
+   * 它要拖到自己的 30 秒 CDP 超时才回话；客户端若在那之前放弃，**回执里的 targetId 就丢了**——
+   * tab 留在他浏览器里，World 认不出、`browser_close` 也关不掉（2026-09-30 那三条 example.com
+   * 孤儿就是这么来的）。拆成两步之后：建 tab 很快（本机量过 167 毫秒），id 先拿到手、先认下来，
+   * 导航另走 `navigate()`，成不成都不丢页面。
+   */
+  async openBlank(timeoutMs: number, signal?: AbortSignal): Promise<string> {
     const body = await this.json<{ targetId?: unknown }>('/new', {
       method: 'POST',
-      body: url,
+      body: 'about:blank',
       timeoutMs,
       ...(signal ? { signal } : {}),
     });
