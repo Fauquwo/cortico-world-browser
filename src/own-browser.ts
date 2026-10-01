@@ -60,10 +60,13 @@ export function devToolsActivePortFile(home: string): string {
  * 固定启动参数。每条都有理由，别顺手删：
  *
  * - `--remote-debugging-port`：给她一个调试口，我们与上游都从这里进去。
- * - `--remote-allow-origins=*`：我们直连它的 WebSocket 做"调前台"（Chrome 111 起会挡掉
- *   没带来源头的连接）。
+ * - `--remote-allow-origins=*`：我们直连它的 WebSocket（建窗口、搬窗口、调前台都用它；
+ *   Chrome 111 起会挡掉没带来源头的连接）。
+ * - `--window-position=-32000,-32000`：**她的窗口起在屏幕外**。这是 2026-10-01 夜定的默认：
+ *   量到"页面在一个自己窗口里"就足以让它是 visible、媒体就能播，**根本不需要抬窗口、也不需要抢焦点**；
+ *   而窗口起在屏幕外之后，连"盖到操作员屏幕上"也没有了。要给她看东西时再由 `showTarget()` 搬回来。
  * - `CalculateNativeWinOcclusion` **关掉**：Windows 上被别的窗口盖住的窗口会被判成 hidden，
- *   于是**她在后台播着的视频会被掐掉**。关掉之后"被盖住"不再等于"看不见"。
+ *   于是**她播着的视频会被掐掉**。关掉之后"被盖住"不再等于"看不见"。
  * - `IntensiveWakeUpThrottling` 与三个 `--disable-background*-throttling/renderer`：
  *   隐藏 tab 的定时器别再被按秒/按分钟夹（量到过：长闲置的 tab 里一个 200 毫秒定时器
  *   30 秒都没响）。
@@ -77,6 +80,8 @@ export function ownBrowserArgs(opts: OwnBrowserOptions): string[] {
     `--user-data-dir=${chromeProfileDir(opts.home)}`,
     `--remote-debugging-port=${opts.cdpPort}`,
     '--remote-allow-origins=*',
+    '--window-position=-32000,-32000',
+    '--window-size=1100,800',
     '--no-first-run',
     '--no-default-browser-check',
     '--no-service-autorun',
@@ -224,26 +229,16 @@ export class OwnBrowser {
   }
 }
 
-/**
- * 把某个 tab 调到前台，并读回它现在的 `document.visibilityState` 当回执。
- *
- * 这是整个"她能播"的开关：量过的实底是——隐藏 tab 里 `play()` 既不 resolve 也不 reject、
- * `readyState` 停在 0；`Target.activateTarget` 之后同一句 `play()` 立刻走完、`readyState: 4`、
- * `currentTime` 开始走。顺带它还把冻结的 tab 叫醒。
- *
- * 直连浏览器自己的 WebSocket（Node 22 原生 `WebSocket`），因为上游没有这个端点。
- */
-export async function activateTarget(
-  cdpPort: number,
-  targetId: string,
-  timeoutMs = 5000,
-): Promise<{ visibility: string }> {
+/** 直连浏览器自己的 WebSocket 说几句 CDP。上游 13 个端点里没有这些，只能自己接。 */
+type CdpCall = (method: string, params?: Record<string, unknown>, sessionId?: string) => Promise<unknown>;
+
+async function withCdp<T>(cdpPort: number, timeoutMs: number, fn: (call: CdpCall) => Promise<T>): Promise<T> {
   const version = await readVersion(cdpPort, timeoutMs);
   if (!version) throw new Error(`浏览器的调试口 ${cdpPort} 没响应`);
 
   const ws = new WebSocket(version.wsUrl);
   let seq = 0;
-  const call = (method: string, params: Record<string, unknown>, sessionId?: string): Promise<unknown> => {
+  const call: CdpCall = (method, params = {}, sessionId) => {
     const id = ++seq;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -280,16 +275,7 @@ export async function activateTarget(
         reject(new Error('连不上浏览器的 WebSocket'));
       });
     });
-
-    await call('Target.activateTarget', { targetId });
-    const attached = (await call('Target.attachToTarget', { targetId, flatten: true })) as { sessionId: string };
-    const evaluated = (await call(
-      'Runtime.evaluate',
-      { expression: 'document.visibilityState', returnByValue: true },
-      attached.sessionId,
-    )) as { result?: { value?: unknown } };
-    const visibility = typeof evaluated.result?.value === 'string' ? evaluated.result.value : '';
-    return { visibility };
+    return await fn(call);
   } finally {
     try {
       ws.close();
@@ -297,6 +283,103 @@ export async function activateTarget(
       // 关不掉无所谓
     }
   }
+}
+
+/** 读一个页面现在的 `document.visibilityState`（用来当回执，也用来判断"活没活"）。 */
+async function visibilityOf(call: CdpCall, targetId: string): Promise<string> {
+  const attached = (await call('Target.attachToTarget', { targetId, flatten: true })) as { sessionId?: unknown };
+  const sessionId = typeof attached.sessionId === 'string' ? attached.sessionId : '';
+  const evaluated = (await call(
+    'Runtime.evaluate',
+    { expression: 'document.visibilityState', returnByValue: true },
+    sessionId,
+  )) as { result?: { value?: unknown } };
+  return typeof evaluated.result?.value === 'string' ? evaluated.result.value : '';
+}
+
+/**
+ * 建**一个她自己的窗口**装这一页（不激活）。
+ *
+ * 为什么不是"后台 tab"（上游 `/new` 建的就是那个）：量到过——后台 tab 里页面是 `hidden`，
+ * 媒体**根本不加载**（`play()` 既不 resolve 也不 reject、`readyState` 停在 0）；而"页面在一个自己
+ * 窗口里"就足以让它是 `visible`、媒体照播，**不需要抬窗口、也不需要抢焦点**。
+ * `newWindow: true` + `background: true` 正好是"窗口建出来、但不激活"——他的键盘焦点不会被拿走。
+ *
+ * 配合启动参数里的 `--window-position=-32000,-32000`，这个窗口连"盖到他屏幕上"都没有。
+ */
+export async function createWindow(cdpPort: number, url: string, timeoutMs = 5000): Promise<{ targetId: string }> {
+  return withCdp(cdpPort, timeoutMs, async (call) => {
+    const created = (await call('Target.createTarget', { url, newWindow: true, background: true })) as {
+      targetId?: unknown;
+    };
+    const targetId = typeof created.targetId === 'string' ? created.targetId : '';
+    if (!targetId) throw new Error('建窗口没拿到 targetId');
+    return { targetId };
+  });
+}
+
+/** "搬回屏幕内"时窗口落到哪儿：左上角留点余量，大小用它自己的。 */
+const SHOW_LEFT = 90;
+const SHOW_TOP = 70;
+
+/**
+ * 把她的某个页面**搬到他眼前**：窗口从屏幕外搬回来 + 激活（= 真弹）。
+ *
+ * 这个是"她想让他看"的动作，不是默认行为：平时她的窗口在屏幕外，媒体照样播、也不打扰他。
+ * 注意 `setWindowBounds` 本身有时就会把窗口带到前面（量到过两次跑结果不一），而这正是这里想要的语义。
+ */
+export async function showTarget(
+  cdpPort: number,
+  targetId: string,
+  timeoutMs = 5000,
+): Promise<{ visibility: string }> {
+  return withCdp(cdpPort, timeoutMs, async (call) => {
+    const win = (await call('Browser.getWindowForTarget', { targetId })) as { windowId?: unknown };
+    const windowId = typeof win.windowId === 'number' ? win.windowId : 0;
+    if (windowId === 0) throw new Error('拿不到这个页面的窗口号');
+    await call('Browser.setWindowBounds', {
+      windowId,
+      bounds: { left: SHOW_LEFT, top: SHOW_TOP, windowState: 'normal' },
+    });
+    await call('Target.activateTarget', { targetId });
+    return { visibility: await visibilityOf(call, targetId) };
+  });
+}
+
+/** 把某个 tab 调到前台（并读回它的 visibilityState）。窗口在屏幕外时，这个动作不会让他看见东西。 */
+export async function activateTarget(
+  cdpPort: number,
+  targetId: string,
+  timeoutMs = 5000,
+): Promise<{ visibility: string }> {
+  return withCdp(cdpPort, timeoutMs, async (call) => {
+    await call('Target.activateTarget', { targetId });
+    return { visibility: await visibilityOf(call, targetId) };
+  });
+}
+
+/**
+ * 读某个页面所在窗口的位置与状态。
+ *
+ * 给验证与诊断用：她开页时这个窗口该是屏幕外那个坐标（`--window-position=-32000,-32000`），
+ * `showTarget()` 之后该回到屏幕内。
+ */
+export async function windowBounds(
+  cdpPort: number,
+  targetId: string,
+  timeoutMs = 5000,
+): Promise<{ left: number; top: number; windowState: string }> {
+  return withCdp(cdpPort, timeoutMs, async (call) => {
+    const win = (await call('Browser.getWindowForTarget', { targetId })) as {
+      bounds?: { left?: unknown; top?: unknown; windowState?: unknown };
+    };
+    const bounds = win.bounds ?? {};
+    return {
+      left: typeof bounds.left === 'number' ? bounds.left : 0,
+      top: typeof bounds.top === 'number' ? bounds.top : 0,
+      windowState: typeof bounds.windowState === 'string' ? bounds.windowState : '',
+    };
+  });
 }
 
 function describe(err: unknown): string {

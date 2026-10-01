@@ -11,9 +11,9 @@ bot 能在浏览器里开页、读页、点击、填表、上传、滚动、截�
 - **借他日常那个浏览器**（默认）：带着他所有网站的登录态，页面开在后台 tab 里。`browser_close`
   只接受 bot 自己开的页面——关掉他自己开着的页面是不可逆的，机械上就该拦。
 - **给她自己的实例**（`ownBrowser: true`）：本 World 拉起一个专属 Chrome（独立 profile 与调试端口），
-  页面开在她自己的窗口里、并且会被带到前台。**要让她播视频就得用这一种**——量到过：后台 tab 里
-  媒体根本加载不起来（页面调 `play()`，`readyState` 一直 0），而 `Target.activateTarget` 之后同一句
-  `play()` 立刻走完。代价是登录态不共享，要用的站点得在这个 profile 里登一次。
+  每个页面开在**它自己的窗口**里、窗口停在**屏幕外**——媒体照播，但操作员看不见、键盘焦点也不会被抢。
+  她要打断他时才用 `browser_focus` 把某个页面搬到他眼前。代价是登录态不共享，要用的站点得在这个
+  profile 里登一次。
 
 | 文件 | 内容 |
 |---|---|
@@ -44,7 +44,7 @@ bot 能在浏览器里开页、读页、点击、填表、上传、滚动、截�
 | `ownBrowserExe` | `chrome.exe` 的绝对路径（专属实例只拉 Chrome） |
 | `ownBrowserHome` | 她的"家"目录。profile 落在 `<home>\Google\Chrome\User Data` |
 | `ownBrowserPort` | 这个实例的调试端口，默认 `9223`（别和 9222 上的日常浏览器撞） |
-| `bringToFront` | 默认开：开页/导航后把 tab 调到前台。**关掉她就播不了媒体** |
+| `bringToFront` | 默认 `true`：**允不允许她打断你**（把某个页面搬到你眼前）。这不是"页面能不能播"的开关——她的页面默认在屏幕外，媒体照样播 |
 
 为什么这样接：上游只从各浏览器**默认 profile** 的 `DevToolsActivePort` 找浏览器（现代 Chrome 用
 `--remote-debugging-port` 启动时并不写这个文件），所以本 World 拉起 proxy 时把"家"当 `LOCALAPPDATA`
@@ -64,23 +64,29 @@ bot 能在浏览器里开页、读页、点击、填表、上传、滚动、截�
 起好之后还会**核对 proxy 连的确实是那个实例**（`/health` 的 `chromePort`）：端口上挂着一个连别处的
 旧 proxy 时，当场投 `browser.down` 说清，而不是静默地去操作操作员的浏览器。
 
-## 前台与后台（决定她能不能播东西）
+## 前台与后台（决定她会不会打扰你）
 
-2026-10-01 在本机量到的（一台真的 Chrome，隐藏 tab 与前台 tab 各测一遍）：
+2026-10-01 在本机量到的。这里有三件**互相独立**的事，别混：**页面活不活**、**操作员看不看得见**、
+**键盘焦点在谁那儿**。
 
-| 测什么 | 后台 tab | 带到前台之后 |
-|---|---|---|
-| 同步读 DOM | 正常 | 正常 |
-| 定时器 | 刚开出来还灵；闲置几分钟后**整个 tab 被冻结**，200 毫秒的定时器 30 秒都不响 | 正常 |
-| `audio.play()` 不靠手势 | **既不 resolve 也不 reject**，`readyState` 停在 0、`currentTime` 不动 | `resolved`、`readyState: 4`、时间开始走 |
+| 怎么开这一页 | visibility | 媒体 | 抢键盘焦点 | 盖到他屏幕上 |
+|---|---|---|---|---|
+| 后台 tab（上游 `/new`） | hidden | **播不了**（`readyState` 停在 0） | 不抢 | 不盖 |
+| 后台 tab + 调到前台（早些的实装） | visible | 能播 | **抢** | **盖** |
+| 新窗口 + 不激活 | visible | 能播 | 不抢 | 盖（新窗口落在 z 序顶上） |
+| **新窗口 + 屏幕外**（现在的默认） | **visible** | **能播** | **不抢** | **不盖** |
 
-启动参数治不了后台那一条（试过 `--autoplay-policy=no-user-gesture-required` 等），**只有把 tab 调到
-前台**。所以：`browser_open` / `browser_navigate` 之后会自动带到前台；`browser_focus` 用来把闲置
-很久、已经冻住的页面叫醒。专属实例的启动参数里还有一条
-`--disable-features=CalculateNativeWinOcclusion`：不然她的窗口被别人盖住时，正在播的视频会被掐掉。
+结论：媒体要的不是"前台"，而是"那个页面是它所在窗口里**被选中的那一个**"。所以她的每个页面开在
+自己的窗口里（`Target.createTarget({ newWindow: true, background: true })`，不走上游 `/new`——
+那个只建后台 tab），实例启动时带 `--window-position=-32000,-32000`，于是这些窗口都在屏幕外：
+媒体照播、截图照截、不抢焦点、不挡他。
 
-上游 13 个端点里没有"调到前台"，所以 `own-browser.ts` 直连浏览器自己的 WebSocket 发
-`Target.activateTarget`（Node 22 原生 `WebSocket`，不加依赖）。
+要打断他时才搬回来：`browser_focus` = `Browser.setWindowBounds`（回屏幕内）+ `Target.activateTarget`。
+上游 13 个端点里没有这几个，所以 `own-browser.ts` 直连浏览器自己的 WebSocket（Node 22 原生
+`WebSocket`，不加依赖）。
+
+上游的 `tabIdleMinutes`（闲置自动关页）管不到这些窗口——上游不认识我们直连建的窗口，所以本 World
+自己补了一份回收（每次工具调用顺便扫一眼，不挂定时器）。
 
 ## 失败怎么念（哪一类，决定贴哪句话）
 

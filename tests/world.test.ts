@@ -322,11 +322,12 @@ describe('Browser World', () => {
     expect(vars['browser.front']).toContain('后台 tab');
   });
 
-  it('环境提示词：她自己的实例说成"会被带到最前面"', () => {
+  it('环境提示词：她自己的实例说成"窗口停在屏幕外、媒体照样能播"', () => {
     const world = startedWorld(3456, { browser: 'chrome', ownBrowser: true, ownBrowserPort: 9223 });
     const vars = world.envPromptVars();
     expect(vars['browser.kind']).toContain('专属实例');
-    expect(vars['browser.front']).toContain('带到最前面');
+    expect(vars['browser.front']).toContain('屏幕外');
+    expect(vars['browser.front']).toContain('媒体');
   });
 
   it('没有子进程时 stop() 是空操作', async () => {
@@ -879,11 +880,13 @@ describe('她自己的浏览器实例', () => {
     };
   }
 
-  it('启动参数：让"前台能播"的那几条都在（谁删掉谁负责）', () => {
+  it('启动参数：屏幕外 + 让"页面能活"的那几条都在（谁删掉谁负责）', () => {
     const args = ownBrowserArgs({ exePath: 'chrome.exe', home: 'H', cdpPort: 9223 });
     expect(args).toContain(`--user-data-dir=${chromeProfileDir('H')}`);
     expect(args).toContain('--remote-debugging-port=9223');
     expect(args).toContain('--remote-allow-origins=*');
+    // 她的窗口起在屏幕外：这是"默认不打扰他"的那一条。
+    expect(args).toContain('--window-position=-32000,-32000');
     expect(args).toContain('--autoplay-policy=no-user-gesture-required');
     expect(args).toContain('--disable-background-timer-throttling');
     expect(args.some((arg) => arg.includes('CalculateNativeWinOcclusion'))).toBe(true);
@@ -959,19 +962,31 @@ describe('她自己的浏览器实例', () => {
     expect(out.text).not.toContain('[变化]');
   });
 
-  it('没配专属实例时 browser_focus 拒绝，并说清为什么', async () => {
+  it('借他日常那个浏览器时，browser_focus 拒绝并说清为什么', async () => {
     const proxy = await fakeProxy();
     const world = startedWorld(proxy.port, { skillDir: scratchDir });
     await world.start(new FakeHost());
 
     const out = await call(world, 'browser_focus', { target: 'T1' });
     expect(out.failed).toBe(true);
-    expect(out.text).toContain('没配专属实例');
+    expect(out.text).toContain('借的是操作员日常那个浏览器');
   });
 
-  it('开页之后会去调前台；调不成时在回执里说明，而不是当作失败', async () => {
+  it('操作员关掉"允许她弹"时，browser_focus 拒绝（页面留在屏幕外）', async () => {
     const proxy = await fakeProxy();
-    const cdp = await fakeBrowserCdp(); // 它的 ws 地址不是真的 WebSocket 服务
+    const cdp = await fakeBrowserCdp();
+    proxy.chromePort = cdp.port;
+    const world = startedWorld(proxy.port, { ...ownPatch(cdp.port), bringToFront: false });
+    await world.start(new FakeHost());
+
+    const out = await call(world, 'browser_focus', { target: 'T1' });
+    expect(out.failed).toBe(true);
+    expect(out.text).toContain('不想被打断');
+  });
+
+  it('专属实例下开页建的是"她自己的窗口"；建不成时退回后台 tab，并在回执里说明', async () => {
+    const proxy = await fakeProxy();
+    const cdp = await fakeBrowserCdp(); // 它的 ws 地址不是真的 WebSocket 服务，所以建窗口必失败
     proxy.chromePort = cdp.port;
     proxy.evalReply = () => PAGE_DUMP;
     const world = startedWorld(proxy.port, ownPatch(cdp.port));
@@ -980,6 +995,41 @@ describe('她自己的浏览器实例', () => {
     const out = await call(world, 'browser_open', { url: 'example.com/a' });
     expect(out.failed).toBeFalsy();
     expect(out.text).toContain('已打开');
-    expect(out.text).toContain('没能把这个页面带到前台');
+    // 退回那条路要说清代价（媒体播不了），而不是静默降级。
+    expect(out.text).toContain('退回了后台 tab');
+    expect(proxy.hits).toContain('/new');
+  });
+
+  it('开页不再自动弹到他眼前：专属实例下 open 不碰窗口位置/激活', async () => {
+    const proxy = await fakeProxy();
+    const cdp = await fakeBrowserCdp();
+    proxy.chromePort = cdp.port;
+    proxy.evalReply = () => PAGE_DUMP;
+    const world = startedWorld(proxy.port, ownPatch(cdp.port));
+    await world.start(new FakeHost());
+
+    const out = await call(world, 'browser_open', { url: 'example.com/a' });
+    expect(out.failed).toBeFalsy();
+    // 成功那条路一个字都不提"前台/眼前"：默认不打扰他。
+    expect(out.text).not.toContain('带到前台');
+    expect(out.text).not.toContain('搬到');
+  });
+
+  it('她自己开的窗口闲置太久会被收掉（上游不认识这些窗口，回收在这里）', async () => {
+    const proxy = await fakeProxy();
+    const cdp = await fakeBrowserCdp();
+    proxy.chromePort = cdp.port;
+    proxy.evalReply = () => PAGE_DUMP;
+    // 0.00005 分钟 ≈ 3 毫秒：用极小值来验"到点就收"，不必真等一分钟。
+    const world = startedWorld(proxy.port, { ...ownPatch(cdp.port), tabIdleMinutes: 0.00005 });
+    await world.start(new FakeHost());
+
+    const opened = await call(world, 'browser_open', { url: 'example.com/a' });
+    const target = /target (T\d+)/.exec(opened.text)?.[1] ?? '';
+    expect(target).not.toBe('');
+
+    await sleep(20);
+    await call(world, 'browser_tabs'); // 任何一次工具调用都会顺手扫一遍
+    expect(proxy.closed).toContain(target);
   });
 });

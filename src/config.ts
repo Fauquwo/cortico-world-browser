@@ -51,12 +51,11 @@ export interface BrowserConfigSection {
   /** 这个实例的 CDP 调试端口。别和操作员那个浏览器的撞（Edge 常用 9222）。 */
   ownBrowserPort: number;
   /**
-   * 开页/导航之后把那个 tab 调到前台。
+   * 允不允许她**把页面搬到操作员眼前**（`browser_focus`）。
    *
-   * 为什么需要（2026-10-01 量到的）：隐藏 tab 里媒体**加载不起来**——页面调了 `play()`，
-   * `readyState` 一直停在 0、`currentTime` 不动，闲置几分钟后整个 tab 还被冻结；
-   * `Target.activateTarget` 之后同一句 `play()` 立刻走完、`readyState: 4`、时间开始走。
-   * 所以这是"她能播视频"的开关。关着时她的页面永远在后台，只有静态读页能用。
+   * 注意这**不是**"页面能不能活/能不能播"的开关：2026-10-01 夜量清楚了，页面在她自己的窗口里
+   * 就是可见的、媒体照播，不需要抬窗口也不需要抢焦点。所以她平时干活不碰操作员的屏幕；
+   * 这一项管的是"她可不可以打扰他"——关掉之后 `browser_focus` 会拒绝并说清。
    */
   bringToFront: boolean;
 }
@@ -150,10 +149,11 @@ export const BROWSER_CONFIG_GROUP: ConfigGroup = {
       },
       'worlds.browser.bringToFront': {
         type: 'boolean',
-        title: '开页后调到前台',
+        title: '允许她弹到你眼前',
         description:
-          '开页/导航之后把那个 tab 调到前台，默认开。媒体播放需要它是前台 tab（后台 tab 里媒体加载不起来，' +
-          '2026-10-01 实测），所以除非你确定她只读静态页面，否则别关。改完要重启这个 World 才生效。',
+          '她可不可以把某个页面**搬到你眼前**（browser_focus：窗口搬回屏幕内 + 激活），默认允许。' +
+          '注意这不是"页面能不能播"的开关——她的页面平时停在屏幕外，媒体照样播、也不会打扰你；' +
+          '这一项只管"她能不能打断你"。关掉之后她调那个工具会被拒绝并说明原因。改完要重启这个 World 才生效。',
         'x-hot': false,
       },
     },

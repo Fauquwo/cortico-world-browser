@@ -22,7 +22,7 @@ import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CdpRelay } from '../src/cdp-client.ts';
-import { OwnBrowser, activateTarget } from '../src/own-browser.ts';
+import { OwnBrowser, createWindow, showTarget, windowBounds } from '../src/own-browser.ts';
 import { readExpression } from '../src/page-scripts.ts';
 
 function arg(name: string, fallback: string): string {
@@ -209,16 +209,22 @@ if (own && health?.chromePort && health.chromePort !== cdpPort) {
 
 console.log('浏览器已接上，开始走一遍：');
 
-/** 与 World 同一条路：先建空白 tab（拿住 id），再导航，再带到前台。 */
+/**
+ * 与 World 同一条路：专属模式下建"她自己的窗口"（不激活、屏幕外），再单独导航。
+ * 借他日常那个浏览器时仍旧是上游 `/new` 那个后台 tab。
+ */
 async function openAndRead(url: string, maxChars = 1200): Promise<string> {
-  const target = await relay.openBlank(30000);
-  console.log(`  开了新页：target=${target}`);
+  let target: string;
+  if (own) {
+    const created = await createWindow(cdpPort, 'about:blank', 5000);
+    target = created.targetId;
+    console.log(`  开了她的窗口：target=${target}`);
+  } else {
+    target = await relay.openBlank(30000);
+    console.log(`  开了新页：target=${target}`);
+  }
   await relay.navigate(target, url, 35000);
   console.log(`  导航到 ${url}`);
-  if (own) {
-    const { visibility } = await activateTarget(cdpPort, target, 5000);
-    console.log(`  带到前台：visibilityState=${visibility}`);
-  }
   const dump = await relay.evaluate(target, readExpression(null, maxChars), 30000);
   if (dump.ok) {
     const page = dump.value as { title?: string; url?: string; text?: string; links?: unknown[] };
@@ -235,29 +241,47 @@ async function openAndRead(url: string, maxChars = 1200): Promise<string> {
 if (own) {
   const verdict = await withMediaServer(async (mediaUrl) => {
     const target = await openAndRead(mediaUrl);
-    // 页面自己每 250 毫秒更新一次状态；等两秒让它把 currentTime 走起来。
+
+    // ① 窗口该在屏幕外：她自己干活不该占他的屏幕。
+    const placed = await windowBounds(cdpPort, target, 5000);
+    console.log(`  窗口位置：${JSON.stringify(placed)}`);
+    const offscreen = placed.left < 0 || placed.top < 0;
+
+    // ② 没有做过任何"调前台"，页面也该是活的、媒体在走。
     await new Promise((resolve) => setTimeout(resolve, 2200));
     const read = await relay.evaluate(target, MEDIA_READ, 15000);
     const state = read.ok ? (read.value as string) : `读不到：${read.error}`;
-    console.log(`  媒体状态：${state}`);
+    console.log(`  媒体状态（未做任何调前台）：${state}`);
 
     const shot = await relay.screenshot(target, 30000);
     const shotPath = join(tmpdir(), 'cortico-browser-smoke.png');
     writeFileSync(shotPath, shot);
     console.log(`  截图：${shot.length} 字节，写到 ${shotPath}`);
 
+    // ③ "搬到他眼前"：窗口回屏幕内 + 激活。
+    const shown = await showTarget(cdpPort, target, 5000);
+    const after = await windowBounds(cdpPort, target, 5000);
+    console.log(`  showTarget 之后：visibility=${shown.visibility} 窗口=${JSON.stringify(after)}`);
+
     await relay.close(target, 30000);
     console.log(`  关掉了 ${target}`);
 
-    const parsed = read.ok ? (JSON.parse(read.value as string) as { currentTime: number; visibility: string; paused: boolean }) : null;
-    return parsed !== null && parsed.currentTime > 0 && parsed.paused === false
-      ? { pass: true, detail: `${parsed.visibility}、currentTime=${parsed.currentTime}、paused=${parsed.paused}` }
-      : { pass: false, detail: state };
+    const parsed = read.ok
+      ? (JSON.parse(read.value as string) as { currentTime: number; visibility: string; paused: boolean })
+      : null;
+    const mediaOk = parsed !== null && parsed.currentTime > 0 && parsed.paused === false;
+    const showOk = shown.visibility === 'visible' && after.left >= 0 && after.top >= 0;
+    return {
+      pass: mediaOk && offscreen && showOk,
+      detail:
+        `屏幕外=${offscreen}（${placed.left},${placed.top}） 媒体=${mediaOk}（${state}） ` +
+        `搬到眼前=${showOk}（${shown.visibility}，${after.left},${after.top}）`,
+    };
   });
 
-  if (verdict.pass) console.log(`媒体能不能播：过（${verdict.detail}）`);
+  if (verdict.pass) console.log(`她的浏览器这条：过 —— ${verdict.detail}`);
   else {
-    console.error(`媒体能不能播：没过（${verdict.detail}）`);
+    console.error(`她的浏览器这条：没过 —— ${verdict.detail}`);
     await relay.stop();
     ownBrowser?.stop();
     process.exit(1);
