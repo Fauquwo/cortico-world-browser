@@ -24,6 +24,7 @@ import { nowIso } from 'cortico/core/util.ts';
 import { CdpRelay, RelayError, classifyRelayError, runFindUrl, type EvalResult, type PageTarget, type RelayFailureKind, type RelayHealth } from './cdp-client.ts';
 import { BROWSER_CONFIG_GROUP, type BrowserConfigSection } from './config.ts';
 import { OwnBrowser, createWindow, showTarget } from './own-browser.ts';
+import { raiseSentence, type RaiseResult } from './window-raise.ts';
 import { readExpression, typeExpression } from './page-scripts.ts';
 
 const ENV_PROMPT_FILE = fileURLToPath(new URL('./ENV_PROMPT.md', import.meta.url));
@@ -434,7 +435,7 @@ export class BrowserWorld implements World {
    *
    * 这是"她想让他看"的动作，不是默认行为——平时她的窗口在屏幕外，媒体照样播、也不打扰他。
    */
-  private async show(targetId: string): Promise<{ visibility: string } | { error: string } | null> {
+  private async show(targetId: string): Promise<{ visibility: string; raise: RaiseResult } | { error: string } | null> {
     if (!this.own) return null;
     try {
       return await showTarget(this.opts.cfg.ownBrowserPort, targetId, Math.min(5000, this.timeout()));
@@ -777,20 +778,24 @@ export class BrowserWorld implements World {
   }
 
   /**
-   * 把一个页面**搬到操作员眼前**（窗口从屏幕外搬回来 + 激活）。
+   * 把一个页面**搬到操作员眼前**（窗口从屏幕外搬回来 + 激活 + 抬到别人窗口之上）。
    *
    * 这不是"让页面能播"——量到过：页面在她自己的窗口里就是可见的、媒体照播，**不需要抬窗口、也不需要
    * 抢焦点**。它的语义是"她想让操作员看某样东西"，所以只在真的想让他看时用：它会把他的屏幕占住。
+   * 回执里带**抬完之后量到的真实相对位置**：抬不成、或被独占全屏的程序挡着时会直说，别让她以为
+   * "搬过去了"就等于"他看见了"（2026-10-02 之前就是这么栽的）。
    */
   private focusTool(): ToolDef {
     return {
       name: 'browser_focus',
       description:
-        'Bring one of your pages into the operator\'s view: its window is moved back on screen and brought to the ' +
-        'front. Use it when you actually want him to look at something. This is the only tool that takes over his ' +
-        'screen, so reach for it deliberately — your pages work fine, media included, while they stay off screen, ' +
-        'and this interrupts whatever he is doing. The receipt tells you the page\'s document.visibilityState ' +
-        'afterwards.',
+        'Bring one of your pages into the operator\'s view: its window is moved back on screen and raised above ' +
+        'whatever he is using (no keyboard focus is taken). Use it when you actually want him to look at ' +
+        'something. This is the only tool that takes over his screen, so reach for it deliberately — your pages ' +
+        'work fine, media included, while they stay off screen, and this interrupts whatever he is doing. The ' +
+        'receipt tells you the page\'s document.visibilityState afterwards, and whether the window really ended ' +
+        'up above the program he was using — if it says it did not, he cannot see it (a program in exclusive ' +
+        'fullscreen cannot be covered by anything) and browser_shot is the reliable way to show him instead.',
       tags: ['act'],
       parameters: {
         type: 'object',
@@ -1130,7 +1135,7 @@ export class BrowserWorld implements World {
     return {
       text:
         `已把 ${target} 搬到操作员眼前（document.visibilityState = ${result.visibility || '未知'}）。` +
-        '他现在看得见这个页面了。',
+        raiseSentence(result.raise),
     };
   }
 

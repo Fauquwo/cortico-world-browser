@@ -8,9 +8,11 @@
  * tab 调到前台它才立刻 `readyState: 4` 播起来。有了专属实例，"调到前台"就只是把她自己的窗口
  * 带上来，不会抢操作员正在用的那个窗口。
  *
- * 这个文件做两件事：
+ * 这个文件做三件事：
  *   1. 起停那个实例（探活 → 复用 → 才 spawn），并给它写上游发现用的 `DevToolsActivePort`；
- *   2. 直接对它说一句 CDP：`Target.activateTarget`——上游 13 个端点里没有"调到前台"的口。
+ *   2. 直接对它说几句 CDP：建窗口、`Target.activateTarget`、搬窗口——上游 13 个端点里没有这些口；
+ *   3. "搬到他眼前"的最后一步（抬 z 序）交给 `window-raise.ts`：CDP 改不了 z 序，那件事只有
+ *      操作系统做得了。2026-10-02 量到的坑就在这：窗口搬回来了，却还压在他正用的程序底下。
  *
  * 为什么 discovery 文件要我们自己写：现代 Chrome 用 `--remote-debugging-port` 启动时**不写**
  * `DevToolsActivePort`（只有 `chrome://inspect` 那个开关写），而上游正是读这个文件找浏览器。
@@ -21,6 +23,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Logger } from 'cortico/core/types.ts';
+import { raiseBrowserWindow, type RaiseResult } from './window-raise.ts';
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
@@ -323,17 +326,19 @@ const SHOW_LEFT = 90;
 const SHOW_TOP = 70;
 
 /**
- * 把她的某个页面**搬到他眼前**：窗口从屏幕外搬回来 + 激活（= 真弹）。
+ * 把她的某个页面**搬到他眼前**：窗口从屏幕外搬回来 + 激活 + **抬到别人窗口之上**。
  *
- * 这个是"她想让他看"的动作，不是默认行为：平时她的窗口在屏幕外，媒体照样播、也不打扰他。
- * 注意 `setWindowBounds` 本身有时就会把窗口带到前面（量到过两次跑结果不一），而这正是这里想要的语义。
+ * 这是"她想让他看"的动作，不是默认行为：平时她的窗口在屏幕外，媒体照样播、也不打扰他。
+ * 注意 `setWindowBounds` 本身有时就会把窗口带到前面（量到过两次跑结果不一）；而 CDP 这一路
+ * **改不了 z 序**——他的程序只要占着屏幕，窗口搬回来也压在底下（2026-10-02 量的就是这个），
+ * 所以最后那一步交给 Windows 自己做（`raiseBrowserWindow`）。
  */
 export async function showTarget(
   cdpPort: number,
   targetId: string,
   timeoutMs = 5000,
-): Promise<{ visibility: string }> {
-  return withCdp(cdpPort, timeoutMs, async (call) => {
+): Promise<{ visibility: string; raise: RaiseResult }> {
+  const placed = await withCdp(cdpPort, timeoutMs, async (call) => {
     const win = (await call('Browser.getWindowForTarget', { targetId })) as { windowId?: unknown };
     const windowId = typeof win.windowId === 'number' ? win.windowId : 0;
     if (windowId === 0) throw new Error('拿不到这个页面的窗口号');
@@ -342,8 +347,25 @@ export async function showTarget(
       bounds: { left: SHOW_LEFT, top: SHOW_TOP, windowState: 'normal' },
     });
     await call('Target.activateTarget', { targetId });
-    return { visibility: await visibilityOf(call, targetId) };
+    const visibility = await visibilityOf(call, targetId);
+
+    // 抬窗口要认"进程 + 标题"这两个东西，趁这条连接还在，一并问出来。
+    const info = (await call('Target.getTargetInfo', { targetId }).catch(() => null)) as {
+      targetInfo?: { title?: unknown };
+    } | null;
+    const title = typeof info?.targetInfo?.title === 'string' ? info.targetInfo.title : '';
+    const procs = (await call('SystemInfo.getProcessInfo').catch(() => null)) as {
+      processInfo?: Array<{ type?: unknown; id?: unknown }>;
+    } | null;
+    const browser = (procs?.processInfo ?? []).find((p) => p.type === 'browser');
+    const pid = typeof browser?.id === 'number' ? browser.id : 0;
+    return { visibility, title, pid };
   });
+
+  // 抬窗口那一步在 CDP 连接之外做：它要开一个 PowerShell，慢一点、失败一点，都不该把
+  // 这次调用判成失败（窗口已经搬回来了，只是可能还被别的程序压着）。
+  const raise = await raiseBrowserWindow({ pid: placed.pid, titleLike: placed.title });
+  return { visibility: placed.visibility, raise };
 }
 
 /** 把某个 tab 调到前台（并读回它的 visibilityState）。窗口在屏幕外时，这个动作不会让他看见东西。 */

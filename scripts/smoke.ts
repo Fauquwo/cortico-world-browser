@@ -258,10 +258,15 @@ if (own) {
     writeFileSync(shotPath, shot);
     console.log(`  截图：${shot.length} 字节，写到 ${shotPath}`);
 
-    // ③ "搬到他眼前"：窗口回屏幕内 + 激活。
+    // ③ "搬到他眼前"：窗口回屏幕内 + 激活 + 抬到别人窗口之上。
     const shown = await showTarget(cdpPort, target, 5000);
     const after = await windowBounds(cdpPort, target, 5000);
     console.log(`  showTarget 之后：visibility=${shown.visibility} 窗口=${JSON.stringify(after)}`);
+    console.log(
+      `  抬窗口：attempted=${shown.raise.attempted} ok=${shown.raise.ok} ` +
+        `盖住前台=${shown.raise.aboveForeground} 前台是「${shown.raise.foregroundTitle}」` +
+        (shown.raise.why ? ` why=${shown.raise.why}` : ''),
+    );
 
     await relay.close(target, 30000);
     console.log(`  关掉了 ${target}`);
@@ -271,11 +276,15 @@ if (own) {
       : null;
     const mediaOk = parsed !== null && parsed.currentTime > 0 && parsed.paused === false;
     const showOk = shown.visibility === 'visible' && after.left >= 0 && after.top >= 0;
+    // 抬窗口这一条要真过：窗口回到屏幕内、但压在他正用的程序底下，等于他看不见（2026-10-02 的现场）。
+    const raiseOk = shown.raise.attempted && shown.raise.ok && shown.raise.aboveForeground;
     return {
-      pass: mediaOk && offscreen && showOk,
+      pass: mediaOk && offscreen && showOk && raiseOk,
       detail:
         `屏幕外=${offscreen}（${placed.left},${placed.top}） 媒体=${mediaOk}（${state}） ` +
-        `搬到眼前=${showOk}（${shown.visibility}，${after.left},${after.top}）`,
+        `搬到眼前=${showOk}（${shown.visibility}，${after.left},${after.top}） ` +
+        `抬到最前=${raiseOk}（盖住前台=${shown.raise.aboveForeground}，前台「${shown.raise.foregroundTitle}」` +
+        `${shown.raise.why ? `，${shown.raise.why}` : ''}）`,
     };
   });
 
