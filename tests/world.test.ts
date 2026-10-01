@@ -931,6 +931,21 @@ describe('她自己的浏览器实例', () => {
     expect(host.events[0].text).toContain('不是她自己的那个');
   });
 
+  it('那个连错浏览器的旧 proxy 一直活着时，后续工具调用也不接管它', async () => {
+    const proxy = await fakeProxy();
+    const cdp = await fakeBrowserCdp();
+    proxy.chromePort = 9222;
+    const world = startedWorld(proxy.port, ownPatch(cdp.port));
+    await world.start(new FakeHost());
+
+    // 它是活的，`/targets` 答得出来——只探活不看连的是谁，就会把页面开到他浏览器里去。
+    const before = proxy.hits.length;
+    const out = await call(world, 'browser_open', { url: 'example.com/a' });
+    expect(out.failed).toBe(true);
+    expect(out.text).toContain('不是她自己的那个');
+    expect(proxy.hits.slice(before)).not.toContain('/new');
+  });
+
   it('专属实例里 browser_tabs 说"你自己的浏览器"，也不报变化段', async () => {
     const proxy = await fakeProxy();
     const cdp = await fakeBrowserCdp();

@@ -309,9 +309,13 @@ export class BrowserWorld implements World {
     const info = health ?? (await this.relay.probe());
     if (!info) return null;
     if (info.chromePort > 0 && info.chromePort !== this.opts.cfg.ownBrowserPort) {
+      const who = info.browserLabel || info.browserId || '未识别';
+      const flag = info.browserId ? `--browser ${info.browserId}` : '--browser …';
       return (
-        `proxy 连的是端口 ${info.chromePort} 上的浏览器，不是她自己的那个（${this.opts.cfg.ownBrowserPort}）。` +
-        `多半是端口 ${this.opts.cfg.port} 上还挂着一个连别处的旧 proxy：先停掉它，或者重启这个 World。`
+        `proxy 连的是端口 ${info.chromePort} 上的浏览器（${who}），不是她自己的那个（${this.opts.cfg.ownBrowserPort}）。` +
+        `多半是端口 ${this.opts.cfg.port} 上还挂着一个上一次运行留下的 cdp-proxy（它的命令行里带 \`${flag}\`）：` +
+        '把那个 node 进程停掉就行——停掉之后这个 World 下次工具调用会自己把 proxy 补拉回来，不必再重启。' +
+        '（如果那是操作员或他的 coding agent 自己起的 proxy，就别动它：把 worlds.browser.port 换一个。）'
       );
     }
     return null;
@@ -462,20 +466,27 @@ export class BrowserWorld implements World {
   /**
    * 工具调用前的现查：状态可能是陈旧的，先探一次；还是不通就顺手补拉一次 proxy，
    * 再不通才报不可用。没有定时器在替她看着，所以补拉挂在这一条路上。
+   *
+   * **每一次转成 ready 都要过 `ownTargetProblem()`**（不只是 `start()` 那一次）：端口上挂着一个
+   * 连别处的旧 proxy 时，它是**活的**，`/targets` 答得出来——只探活不看连的是谁，就会把它当成就绪，
+   * 然后静默地去操作操作员的浏览器。这正是要防的那件事。
    */
   private async ensureReady(): Promise<string | null> {
     if (this.state === 'ready') return null;
-    if (await this.relay.reachable(this.timeout())) {
+    const settle = async (): Promise<string | null> => {
+      const wrong = await this.ownTargetProblem();
+      if (wrong) {
+        this.state = 'failed';
+        this.lastError = wrong;
+        return `浏览器不可用：${wrong}`;
+      }
       this.state = 'ready';
       this.lastError = '';
       return null;
-    }
+    };
+    if (await this.relay.reachable(this.timeout())) return settle();
     await this.tryRelaunch();
-    if (await this.relay.reachable(this.timeout())) {
-      this.state = 'ready';
-      this.lastError = '';
-      return null;
-    }
+    if (await this.relay.reachable(this.timeout())) return settle();
     const port = this.relay.endpoint();
     const reason = this.lastError || this.relay.failure || '没连上浏览器';
     return `浏览器不可用（${port}）：${reason}。${this.connectHint()}`;
