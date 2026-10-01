@@ -12,7 +12,7 @@
  *   1. 起停那个实例（探活 → 复用 → 才 spawn），并给它写上游发现用的 `DevToolsActivePort`；
  *   2. 直接对它说几句 CDP：建窗口、`Target.activateTarget`、搬窗口——上游 13 个端点里没有这些口；
  *   3. "搬到他眼前"的最后一步（抬 z 序）交给 `window-raise.ts`：CDP 改不了 z 序，那件事只有
- *      操作系统做得了。2026-10-02 量到的坑就在这：窗口搬回来了，却还压在他正用的程序底下。
+ *      操作系统做得了。2026-10-01 量到的坑就在这：窗口搬回来了，却还压在他正用的程序底下。
  *
  * 为什么 discovery 文件要我们自己写：现代 Chrome 用 `--remote-debugging-port` 启动时**不写**
  * `DevToolsActivePort`（只有 `chrome://inspect` 那个开关写），而上游正是读这个文件找浏览器。
@@ -156,6 +156,7 @@ export class OwnBrowser {
     if (existing) {
       this.writeDiscovery(existing);
       log.info('复用已在运行的她的浏览器', { endpoint: this.cdpEndpoint(), ws: existing.wsUrl });
+      await this.parkWindows(log);
       return null;
     }
 
@@ -175,7 +176,12 @@ export class OwnBrowser {
       const child = spawn(exe, args, {
         detached: true,
         stdio: 'ignore',
-        windowsHide: true,
+        // 故意**不**用 windowsHide：那面旗会把 SW_HIDE 经 STARTUPINFO 传给子进程，Chrome 的
+        // 第一个窗口（启动那次、以及重启后"恢复上次会话"出来的那个窗口）于是生来就是
+        // **操作系统层面的隐藏**（量到：`IsWindowVisible=0`，任务栏连按钮都没有），
+        // 而她那边 Chrome 自己还认为这窗口是 normal。chrome.exe 是 GUI 程序，不隐藏也不会弹出
+        // 控制台窗口；窗口位置由 `--window-position` 定在屏幕外，所以也不会晃到他眼前。
+        windowsHide: false,
       });
       child.on('error', (err) => {
         this.lastError = `拉不起浏览器：${err.message}`;
@@ -193,11 +199,30 @@ export class OwnBrowser {
       const info = await readVersion(this.opts.cdpPort, PROBE_TIMEOUT_MS);
       if (info) {
         this.writeDiscovery(info);
+        await this.parkWindows(log);
         return null;
       }
       await sleep(READY_POLL_MS);
     }
     return `浏览器起来了但调试口 ${this.opts.cdpPort} 没响应（等了 ${Math.round(timeoutMs / 1000)} 秒）`;
+  }
+
+  /**
+   * 把她现有的窗口都挪回屏幕外。
+   *
+   * 为什么要有这一步：`--window-position=-32000,-32000` 只管**启动那一刻** Chrome 自己开的窗口；
+   * 而 Chrome 重启时会**把上次的窗口恢复回来**，位置是上次保存的（很可能就是"上次被他看过，
+   * 停在屏幕里"的位置）——不收拾一下，重启就等于替她弹一次窗口到他屏幕上。
+   * 顺手也把"上次 raise 过、一直留在屏幕内"的状态清掉。
+   */
+  private async parkWindows(log: Logger): Promise<void> {
+    try {
+      const moved = await parkWindowsOffscreen(this.opts.cdpPort, PROBE_TIMEOUT_MS * 2);
+      if (moved > 0) log.info('把她留在屏幕里的窗口挪回屏幕外', { moved });
+    } catch (err) {
+      // 挪不动不是致命错：她的窗口仍然能用，只是可能浮在他屏幕上。日志留一句就够。
+      log.warn?.('挪窗口没成', { error: err instanceof Error ? err.message : String(err) });
+    }
   }
 
   /** 把发现文件写成它现在的样子。上游据此认出这个实例。 */
@@ -325,12 +350,53 @@ export async function createWindow(cdpPort: number, url: string, timeoutMs = 500
 const SHOW_LEFT = 90;
 const SHOW_TOP = 70;
 
+/** 屏幕外的住处：与 `ownBrowserArgs` 的 `--window-position` 同一个坐标。 */
+const OFFSCREEN_LEFT = -32000;
+const OFFSCREEN_TOP = -32000;
+
+/**
+ * 把她现在开着的窗口都挪回屏幕外，返回挪了几个。
+ *
+ * `--window-position` 只管启动那一刻 Chrome 自己开的窗口；重启时 Chrome 会把上次的窗口按
+ * **保存下来的位置**恢复回来（可能是屏幕里），所以每次就绪之后顺手收拾一遍。
+ */
+export async function parkWindowsOffscreen(cdpPort: number, timeoutMs = 5000): Promise<number> {
+  return withCdp(cdpPort, timeoutMs, async (call) => {
+    const targets = (await call('Target.getTargets')) as { targetInfos?: Array<{ type?: unknown; targetId?: unknown }> };
+    let moved = 0;
+    for (const target of targets.targetInfos ?? []) {
+      if (target.type !== 'page' || typeof target.targetId !== 'string') continue;
+      try {
+        const win = (await call('Browser.getWindowForTarget', { targetId: target.targetId })) as {
+          windowId?: unknown;
+          bounds?: { left?: unknown; top?: unknown };
+        };
+        const windowId = typeof win.windowId === 'number' ? win.windowId : 0;
+        if (windowId === 0) continue;
+        const left = typeof win.bounds?.left === 'number' ? win.bounds.left : OFFSCREEN_LEFT;
+        const top = typeof win.bounds?.top === 'number' ? win.bounds.top : OFFSCREEN_TOP;
+        // 已经在屏幕外（或已经在那个坐标上）就不动它：少一次没必要的 setWindowBounds，
+        // 也少一次"顺手把窗口激活"的机会（量到过它会偶尔抢一下前台）。
+        if (left <= OFFSCREEN_LEFT + 200 && top <= OFFSCREEN_TOP + 200) continue;
+        await call('Browser.setWindowBounds', {
+          windowId,
+          bounds: { left: OFFSCREEN_LEFT, top: OFFSCREEN_TOP, windowState: 'normal' },
+        });
+        moved += 1;
+      } catch {
+        // 单个窗口挪不动不影响别的
+      }
+    }
+    return moved;
+  });
+}
+
 /**
  * 把她的某个页面**搬到他眼前**：窗口从屏幕外搬回来 + 激活 + **抬到别人窗口之上**。
  *
  * 这是"她想让他看"的动作，不是默认行为：平时她的窗口在屏幕外，媒体照样播、也不打扰他。
  * 注意 `setWindowBounds` 本身有时就会把窗口带到前面（量到过两次跑结果不一）；而 CDP 这一路
- * **改不了 z 序**——他的程序只要占着屏幕，窗口搬回来也压在底下（2026-10-02 量的就是这个），
+ * **改不了 z 序**——他的程序只要占着屏幕，窗口搬回来也压在底下（2026-10-01 量的就是这个），
  * 所以最后那一步交给 Windows 自己做（`raiseBrowserWindow`）。
  */
 export async function showTarget(
@@ -349,7 +415,7 @@ export async function showTarget(
     await call('Target.activateTarget', { targetId });
     const visibility = await visibilityOf(call, targetId);
 
-    // 抬窗口要认"进程 + 标题"这两个东西，趁这条连接还在，一并问出来。
+    // 抬窗口要认"进程 + 标题 + 位置尺寸"这三样东西，趁这条连接还在，一并问出来。
     const info = (await call('Target.getTargetInfo', { targetId }).catch(() => null)) as {
       targetInfo?: { title?: unknown };
     } | null;
@@ -359,12 +425,21 @@ export async function showTarget(
     } | null;
     const browser = (procs?.processInfo ?? []).find((p) => p.type === 'browser');
     const pid = typeof browser?.id === 'number' ? browser.id : 0;
-    return { visibility, title, pid };
+    const got = (await call('Browser.getWindowBounds', { windowId }).catch(() => null)) as {
+      bounds?: { left?: unknown; top?: unknown; width?: unknown; height?: unknown };
+    } | null;
+    const expect = {
+      left: typeof got?.bounds?.left === 'number' ? got.bounds.left : SHOW_LEFT,
+      top: typeof got?.bounds?.top === 'number' ? got.bounds.top : SHOW_TOP,
+      width: typeof got?.bounds?.width === 'number' ? got.bounds.width : 0,
+      height: typeof got?.bounds?.height === 'number' ? got.bounds.height : 0,
+    };
+    return { visibility, title, pid, expect };
   });
 
   // 抬窗口那一步在 CDP 连接之外做：它要开一个 PowerShell，慢一点、失败一点，都不该把
   // 这次调用判成失败（窗口已经搬回来了，只是可能还被别的程序压着）。
-  const raise = await raiseBrowserWindow({ pid: placed.pid, titleLike: placed.title });
+  const raise = await raiseBrowserWindow({ pid: placed.pid, titleLike: placed.title, expect: placed.expect });
   return { visibility: placed.visibility, raise };
 }
 

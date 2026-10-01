@@ -264,8 +264,9 @@ if (own) {
     const after = await windowBounds(cdpPort, target, 5000);
     console.log(`  showTarget 之后：visibility=${shown.visibility} 窗口=${JSON.stringify(after)}`);
     console.log(
-      `  抬窗口：attempted=${shown.raise.attempted} ok=${shown.raise.ok} ` +
-        `盖住前台=${shown.raise.aboveForeground} 前台是「${shown.raise.foregroundTitle}」` +
+      `  抬窗口：attempted=${shown.raise.attempted} ok=${shown.raise.ok} 原本隐藏=${shown.raise.wasHidden} ` +
+        `抬的是「${shown.raise.windowTitle}」 挡着的是「${shown.raise.blockedBy}」` +
+        `（置顶=${shown.raise.blockerTopmost}）` +
         (shown.raise.why ? ` why=${shown.raise.why}` : ''),
     );
 
@@ -277,14 +278,14 @@ if (own) {
       : null;
     const mediaOk = parsed !== null && parsed.currentTime > 0 && parsed.paused === false;
     const showOk = shown.visibility === 'visible' && after.left >= 0 && after.top >= 0;
-    // 抬窗口这一条要真过：窗口回到屏幕内、但压在他正用的程序底下，等于他看不见（2026-10-02 的现场）。
-    const raiseOk = shown.raise.attempted && shown.raise.ok && shown.raise.aboveForeground;
+    // 抬窗口这一条要真过：窗口回到屏幕内、但没有可见窗口压在它上面，他才是真看得见。
+    const raiseOk = shown.raise.attempted && shown.raise.ok && shown.raise.blockedBy === '';
     return {
       pass: mediaOk && offscreen && showOk && raiseOk,
       detail:
         `屏幕外=${offscreen}（${placed.left},${placed.top}） 媒体=${mediaOk}（${state}） ` +
         `搬到眼前=${showOk}（${shown.visibility}，${after.left},${after.top}） ` +
-        `抬到最前=${raiseOk}（盖住前台=${shown.raise.aboveForeground}，前台「${shown.raise.foregroundTitle}」` +
+        `抬到最前=${raiseOk}（抬的是「${shown.raise.windowTitle}」，挡着的是「${shown.raise.blockedBy}」` +
         `${shown.raise.why ? `，${shown.raise.why}` : ''}）`,
     };
   });
