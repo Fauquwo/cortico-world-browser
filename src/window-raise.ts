@@ -33,7 +33,7 @@ export interface RaiseResult {
   ok: boolean;
   /** 抬完之后，她的窗口盖在**当前前台窗口**之上吗。这才是"他能不能看见"。 */
   aboveForeground: boolean;
-  /** 抬不起来时的原因（no-window / 拾取失败的一句话）。成功时是空串。 */
+  /** 抬不起来时的原因（人话；脚本里那些短码在 `WHY_IN_WORDS` 里换成说法）。成功时是空串。 */
   why: string;
   /** 抬完那一刻的前台窗口标题（回执里用来点名"挡着的是谁"）。 */
   foregroundTitle: string;
