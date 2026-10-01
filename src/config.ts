@@ -32,6 +32,33 @@ export interface BrowserConfigSection {
   requestTimeoutMs: number;
   /** 本 World 拉起的那个 proxy 里，页面闲置多久被自动关掉（上游默认 15 分钟）。 */
   tabIdleMinutes: number;
+  /**
+   * 给她一个**专属的浏览器实例**（独立 profile、独立调试端口），由本 World 起停。
+   *
+   * 关着时行为不变：操作员日常那个浏览器，带他所有登录态。开着时她的页面活在她自己的
+   * Chrome 里，`bringToFront` 就可以放心把她自己的窗口带上来。代价是登录态不共享：
+   * 要用的站点得在这个 profile 里登一次。
+   */
+  ownBrowser: boolean;
+  /** `ownBrowser` 开着时必填：浏览器可执行文件（一般是 chrome.exe 的绝对路径）。 */
+  ownBrowserExe: string;
+  /**
+   * `ownBrowser` 开着时必填：她的浏览器"家"目录。profile 落在
+   * `<home>/Google/Chrome/User Data`（照 Chrome 自己的布局，上游据此发现它），
+   * 发现文件也写在那里。
+   */
+  ownBrowserHome: string;
+  /** 这个实例的 CDP 调试端口。别和操作员那个浏览器的撞（Edge 常用 9222）。 */
+  ownBrowserPort: number;
+  /**
+   * 开页/导航之后把那个 tab 调到前台。
+   *
+   * 为什么需要（2026-10-01 量到的）：隐藏 tab 里媒体**加载不起来**——页面调了 `play()`，
+   * `readyState` 一直停在 0、`currentTime` 不动，闲置几分钟后整个 tab 还被冻结；
+   * `Target.activateTarget` 之后同一句 `play()` 立刻走完、`readyState: 4`、时间开始走。
+   * 所以这是"她能播视频"的开关。关着时她的页面永远在后台，只有静态读页能用。
+   */
+  bringToFront: boolean;
 }
 
 export const BROWSER_DEFAULTS: BrowserConfigSection = {
@@ -42,6 +69,11 @@ export const BROWSER_DEFAULTS: BrowserConfigSection = {
   readyTimeoutMs: 30000,
   requestTimeoutMs: 30000,
   tabIdleMinutes: 15,
+  ownBrowser: false,
+  ownBrowserExe: '',
+  ownBrowserHome: '',
+  ownBrowserPort: 9223,
+  bringToFront: true,
 };
 
 /** World 配置的 JSON Schema 声明。 */
@@ -86,6 +118,42 @@ export const BROWSER_CONFIG_GROUP: ConfigGroup = {
         type: 'integer',
         title: '闲置关页（分钟）',
         description: '本 World 拉起的 proxy 里，页面闲置这么久被自动关掉，默认 15。改完要重启这个 World 才生效。',
+        'x-hot': false,
+      },
+      'worlds.browser.ownBrowser': {
+        type: 'boolean',
+        title: '用她自己的浏览器实例',
+        description:
+          '开着时本 World 会拉起一个专属 Chrome（独立 profile 与调试端口），不再借操作员日常那个。' +
+          '想让她放视频、并且不打扰操作员自己的浏览器时开着。代价：登录态不共享。改完要重启这个 World 才生效。',
+        'x-hot': false,
+      },
+      'worlds.browser.ownBrowserExe': {
+        type: 'string',
+        title: '她的浏览器程序',
+        description: 'chrome.exe 的绝对路径，例如 C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe。开了上一项就必填。改完要重启。',
+        'x-hot': false,
+      },
+      'worlds.browser.ownBrowserHome': {
+        type: 'string',
+        title: '她的浏览器"家"目录',
+        description:
+          'profile 放在这个目录下的 Google\\Chrome\\User Data，上游据此发现它。' +
+          '建议放工作区内的一个目录，例如 <工作区>\\state\\browser-home。改完要重启。',
+        'x-hot': false,
+      },
+      'worlds.browser.ownBrowserPort': {
+        type: 'integer',
+        title: '她的浏览器调试端口',
+        description: '这个专属实例的 CDP 端口，默认 9223（别和操作员那个浏览器的 9222 撞）。改完要重启。',
+        'x-hot': false,
+      },
+      'worlds.browser.bringToFront': {
+        type: 'boolean',
+        title: '开页后调到前台',
+        description:
+          '开页/导航之后把那个 tab 调到前台，默认开。媒体播放需要它是前台 tab（后台 tab 里媒体加载不起来，' +
+          '2026-10-01 实测），所以除非你确定她只读静态页面，否则别关。改完要重启这个 World 才生效。',
         'x-hot': false,
       },
     },

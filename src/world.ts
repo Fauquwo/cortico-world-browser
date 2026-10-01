@@ -21,8 +21,9 @@ import type {
   WorldLamp,
 } from 'cortico/core/types.ts';
 import { nowIso } from 'cortico/core/util.ts';
-import { CdpRelay, RelayError, classifyRelayError, runFindUrl, type EvalResult, type PageTarget, type RelayFailureKind } from './cdp-client.ts';
+import { CdpRelay, RelayError, classifyRelayError, runFindUrl, type EvalResult, type PageTarget, type RelayFailureKind, type RelayHealth } from './cdp-client.ts';
 import { BROWSER_CONFIG_GROUP, type BrowserConfigSection } from './config.ts';
+import { OwnBrowser, activateTarget } from './own-browser.ts';
 import { readExpression, typeExpression } from './page-scripts.ts';
 
 const ENV_PROMPT_FILE = fileURLToPath(new URL('./ENV_PROMPT.md', import.meta.url));
@@ -112,6 +113,11 @@ export class BrowserWorld implements World {
   readonly id = 'browser';
 
   private readonly relay: CdpRelay;
+  /**
+   * 配了专属实例时才有：她的浏览器由本 World 起停，并且我们还要直接对它说一句 CDP
+   * （`Target.activateTarget`，上游没有这个端点）。没配时为 null，一切照旧。
+   */
+  private readonly own: OwnBrowser | null;
   private host: WorldHost | null = null;
   private running = false;
   private state: 'idle' | 'starting' | 'ready' | 'failed' = 'idle';
@@ -131,17 +137,36 @@ export class BrowserWorld implements World {
 
   constructor(private readonly opts: BrowserWorldOptions) {
     const cfg = opts.cfg;
+    this.own = cfg.ownBrowser
+      ? new OwnBrowser({
+          exePath: cfg.ownBrowserExe.trim(),
+          home: cfg.ownBrowserHome.trim(),
+          cdpPort: cfg.ownBrowserPort,
+        })
+      : null;
     this.relay = new CdpRelay({
       skillDir: cfg.skillDir.trim(),
       browser: cfg.browser.trim(),
       port: cfg.port,
       tabIdleMinutes: cfg.tabIdleMinutes,
+      // 专属实例那一路：把"家"当 LOCALAPPDATA 交给 proxy，上游据此发现她那个实例。
+      localAppDataRoot: this.own ? cfg.ownBrowserHome.trim() : undefined,
     });
   }
 
-  /** 模板里的占位符：她操作的是哪个浏览器。 */
+  /** 模板里的占位符：她操作的是哪个浏览器、是不是她自己的那个、开出来的页面在前台还是后台。 */
   envPromptVars(): Record<string, string> {
-    return { 'browser.label': displayBrowser(this.opts.cfg.browser) };
+    const own = this.own !== null;
+    const front = own && this.opts.cfg.bringToFront;
+    return {
+      'browser.label': displayBrowser(this.opts.cfg.browser),
+      'browser.kind': own
+        ? '你自己那个专属实例（独立 profile 与调试端口，不带操作员的登录态）'
+        : '操作员日常用的那个浏览器（带着他所有网站的登录态）',
+      'browser.front': front
+        ? '你开出来、导航到的那个页面会被带到最前面——它在你自己的浏览器窗口里，不碍他'
+        : '你开出来的页面是后台 tab，不打扰他',
+    };
   }
 
   console(): WorldConsoleDecl {
@@ -150,6 +175,9 @@ export class BrowserWorld implements World {
       lamps: [this.lamp()],
       badges: [
         { label: '浏览器', value: this.browserLabel || displayBrowser(cfg.browser) || '未配置', tone: 'plain' },
+        ...(this.own
+          ? [{ label: '她的浏览器', value: `127.0.0.1:${cfg.ownBrowserPort}`, tone: 'plain' as const }]
+          : []),
         { label: 'proxy', value: `127.0.0.1:${cfg.port}`, tone: 'plain' },
         { label: '她开的页', value: this.mine.size, tone: 'plain' },
       ],
@@ -161,7 +189,10 @@ export class BrowserWorld implements World {
           description: '这个浏览器这一段进 system 前缀的说明；留空则该 World 不进入前缀。',
           path: ENV_PROMPT_FILE,
           role: 'envPrompt',
-          vars: [{ name: 'browser.label', description: '当前配置要操作的浏览器。' }],
+          vars: [
+            { name: 'browser.label', description: '当前配置要操作的浏览器。' },
+            { name: 'browser.kind', description: '那是她自己的实例，还是操作员日常那个。' },
+          ],
         },
       ],
     };
@@ -172,10 +203,33 @@ export class BrowserWorld implements World {
     this.running = true;
     const log = host.log.child(this.id);
     try {
+      // 配了专属实例：先保证它在跑，并把发现文件写出来——上游的 proxy 就是靠那个文件认出它的。
+      if (this.own) {
+        const ownProblem = await this.own.ensure(log, this.opts.cfg.readyTimeoutMs);
+        if (ownProblem) {
+          this.state = 'failed';
+          this.lastError = ownProblem;
+          log.warn('她自己的浏览器起不来', { error: ownProblem });
+          await this.emit(
+            'browser.down',
+            `浏览器起不来：${ownProblem}。（看 worlds.browser.ownBrowserExe 与 ownBrowserHome 配得对不对。）`,
+          );
+          return;
+        }
+      }
+
       const health = await this.relay.probe();
       if (health) {
         this.browserLabel = health.browserLabel || health.browserId;
         if (await this.relay.reachable()) {
+          const wrongTarget = await this.ownTargetProblem(health);
+          if (wrongTarget) {
+            this.state = 'failed';
+            this.lastError = wrongTarget;
+            log.warn('proxy 连的不是她那个实例', { error: wrongTarget });
+            await this.emit('browser.down', `浏览器不可用：${wrongTarget}`);
+            return;
+          }
           this.state = 'ready';
           log.info('复用已在运行的 cdp-proxy', { endpoint: this.relay.endpoint(), browser: this.browserLabel });
           await this.emit(
@@ -214,6 +268,14 @@ export class BrowserWorld implements World {
         await this.emit('browser.down', `浏览器没能就绪：${this.lastError}。${this.connectHint()}`);
         return;
       }
+      const wrongTarget = await this.ownTargetProblem();
+      if (wrongTarget) {
+        this.state = 'failed';
+        this.lastError = wrongTarget;
+        log.warn('proxy 连的不是她那个实例', { error: wrongTarget });
+        await this.emit('browser.down', `浏览器不可用：${wrongTarget}`);
+        return;
+      }
       this.state = 'ready';
       log.info('浏览器已就绪', { endpoint: this.relay.endpoint(), browser: this.browserLabel });
       await this.emit('browser.ready', `浏览器已就绪（${this.relay.endpoint()}，${this.browserLabel || displayBrowser(this.opts.cfg.browser)}）。`);
@@ -227,11 +289,32 @@ export class BrowserWorld implements World {
   async stop(): Promise<void> {
     this.running = false;
     await this.relay.stop(); // 只关自己拉起的那个
+    this.own?.stop(); // 同理：复用的那个实例不动它
     this.state = 'idle';
     this.host = null;
     this.seen.clear();
     this.seenAt = 0;
     this.recoveryTried = false;
+  }
+
+  /**
+   * 配了专属实例时，核对 proxy 连的**确实是那个实例**。
+   *
+   * 会走神的情形：他刚把 `ownBrowser` 打开，而端口上还挂着一个老的 proxy（连着他日常那个 Edge）。
+   * 那种情况下这个 World 会静默地去操作他的浏览器——正是我们想离开的东西，必须当场说清。
+   * 拿不到 `/health` 时不算这里的问题：工具那条路自己会报。
+   */
+  private async ownTargetProblem(health?: RelayHealth | null): Promise<string | null> {
+    if (!this.own) return null;
+    const info = health ?? (await this.relay.probe());
+    if (!info) return null;
+    if (info.chromePort > 0 && info.chromePort !== this.opts.cfg.ownBrowserPort) {
+      return (
+        `proxy 连的是端口 ${info.chromePort} 上的浏览器，不是她自己的那个（${this.opts.cfg.ownBrowserPort}）。` +
+        `多半是端口 ${this.opts.cfg.port} 上还挂着一个连别处的旧 proxy：先停掉它，或者重启这个 World。`
+      );
+    }
+    return null;
   }
 
   // ——— 状态与轮询 ———
@@ -329,11 +412,42 @@ export class BrowserWorld implements World {
     if (/端口/.test(this.lastError)) {
       return '（换一个没被占用的 worlds.browser.port：Windows 保留的端口段会报 EACCES。）';
     }
+    if (this.own) {
+      return (
+        '（这是她自己那个实例，不是操作员日常的浏览器：看 ownBrowserExe / ownBrowserHome 配得对不对，' +
+        `或它是不是被关掉了、端口 ${this.opts.cfg.ownBrowserPort} 上有没有别的东西。）`
+      );
+    }
     const browser = this.opts.cfg.browser.trim() || 'chrome';
     return (
       `（要在${displayBrowser(browser)}的地址栏打开 ${browser}://inspect/#remote-debugging，` +
       '勾选「Allow remote debugging for this browser instance」。）'
     );
+  }
+
+  /**
+   * 把一个 tab 调到前台。`null` = 用不上（没配专属实例，或者开关关着）；否则是结果。
+   *
+   * 为什么需要（2026-10-01 量的）：隐藏 tab 里媒体**加载不起来**——页面调了 `play()`，
+   * `readyState` 一直停在 0、`currentTime` 不动；闲置几分钟后整个 tab 还被冻结。
+   * 同一句 `play()` 在 `Target.activateTarget` 之后立刻走完。所以"调到前台"就是"她能播"的开关。
+   *
+   * 只在有专属实例时做：那时候带上来的是**她自己的窗口**，不抢操作员正在用的那个。
+   */
+  private async bringToFront(targetId: string): Promise<{ visibility: string } | { error: string } | null> {
+    if (!this.own) return null;
+    if (!this.opts.cfg.bringToFront) return null;
+    try {
+      return await activateTarget(this.opts.cfg.ownBrowserPort, targetId, Math.min(5000, this.timeout()));
+    } catch (err) {
+      return { error: describe(err) };
+    }
+  }
+
+  /** 调前台失败时附在回执里的那句话（成功就什么都不说）。 */
+  private frontNote(result: { visibility: string } | { error: string } | null): string {
+    if (result === null || 'visibility' in result) return '';
+    return `（没能把这个页面带到前台：${result.error}。页面在后台时媒体不会加载，要用到它就先 browser_focus 再试。）`;
   }
 
   private timeout(): number {
@@ -381,6 +495,7 @@ export class BrowserWorld implements World {
       this.shotTool(),
       this.navigateTool(),
       this.tabsTool(),
+      this.focusTool(),
       this.closeTool(),
       this.findUrlTool(),
     ];
@@ -585,14 +700,43 @@ export class BrowserWorld implements World {
     return {
       name: 'browser_tabs',
       description:
-        'List the pages open in the browser right now — what the operator has open and what you opened — plus what ' +
-        'changed since the previous call: the pages he opened, moved or closed in between. Changes are net between ' +
-        'two calls, so a page he opened and closed in between leaves no trace, and the browser\'s own pages ' +
-        '(chrome://…) never appear in them. ' +
-        'Each entry is marked `mine: true` when you opened it — those are the only ones `browser_close` accepts.',
+        'List the pages open in the browser right now, each with its target id. ' +
+        'Entries are marked `mine: true` when you opened them — those are the only ones `browser_close` accepts. ' +
+        'When the browser is the operator\'s own, this also reports what changed since the previous call: the pages ' +
+        'he opened, moved or closed in between, as a net difference (a page he opened and closed in between leaves ' +
+        'no trace, and the browser\'s own pages never appear). ' +
+        'When it is your own instance, there is nobody else browsing in it, so no change section is reported.',
       tags: ['read', 'snapshot'],
       parameters: { type: 'object', additionalProperties: false, properties: {} },
       handler: async () => this.tabs(),
+    };
+  }
+
+  /**
+   * 把一个页面带到前台。
+   *
+   * 它不只是"露个脸"：后台 tab 里页面是僵的（媒体不加载、定时器被夹、久了自己冻住），
+   * 所以这是"把页面叫醒"的手段——要在页面上播东西、或者等一个自己刷新的看板时先叫它。
+   */
+  private focusTool(): ToolDef {
+    return {
+      name: 'browser_focus',
+      description:
+        'Bring one of your pages to the front of the browser, and wake it up. Media only loads and plays in a page ' +
+        'that is in front: a page left in the background for minutes gets frozen, so its timers, animations and ' +
+        'async work stall until it is brought back. Call this before playing something on a page you opened a while ' +
+        'ago, and when a page that used to work seems asleep. The receipt tells you the page\'s ' +
+        'document.visibilityState afterwards.',
+      tags: ['act'],
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          target: { type: 'string', description: 'Target id returned by browser_open or browser_tabs.' },
+        },
+        required: ['target'],
+      },
+      handler: async (args, ctx) => this.focus(args, ctx),
     };
   }
 
@@ -663,18 +807,27 @@ export class BrowserWorld implements World {
     try {
       await this.relay.navigate(targetId, withScheme(raw), this.navTimeout(), ctx.signal);
     } catch (err) {
+      const front = await this.bringToFront(targetId); // 那段短超时试读要页面"活"着才读得到
       const told = this.explain(err, '导航', 'nav');
       const page = await this.dump(targetId, null, OPEN_TEXT_MAX, ctx, NAV_FAILED_DUMP_MS);
       return fail(
         `${told}\n` +
           `target: ${targetId} 这个页面还开着（多半是那个站点的问题）：你稍后可以再 browser_read 一次，或 browser_close 关掉它。` +
+          (front && 'error' in front ? `\n（顺带说一句，也没能把它带到前台：${front.error}。）` : '') +
           (page.ok ? `\n它此刻显示的是：\n${renderPage(page.page, OPEN_TEXT_MAX)}` : ''),
       );
     }
 
+    // ③ 先带到前台再读。隐藏 tab 里的页面是"僵"的：媒体不加载、靠 JS 驱动的渲染也不动，
+    //    带到前台之后读回来的才是它真正的样子。
+    const front = await this.bringToFront(targetId);
     const page = await this.dump(targetId, null, OPEN_TEXT_MAX, ctx);
     if (!page.ok) return fail(`页面已打开（target ${targetId}），但没能读回内容：${page.text}`);
-    return { text: [`已打开（target ${targetId}）。`, renderPage(page.page, OPEN_TEXT_MAX)].join('\n') };
+    return {
+      text: [`已打开（target ${targetId}）。`, this.frontNote(front), renderPage(page.page, OPEN_TEXT_MAX)]
+        .filter((part) => part !== '')
+        .join('\n'),
+    };
   }
 
   private async read(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {
@@ -831,9 +984,10 @@ export class BrowserWorld implements World {
     try {
       if (back) await this.relay.back(target, this.navTimeout(), ctx.signal);
       else await this.relay.navigate(target, withScheme(url), this.navTimeout(), ctx.signal);
+      const front = await this.bringToFront(target);
       const info = await this.relay.info(target, this.timeout(), ctx.signal).catch(() => null);
       const where = info ? `${info.title || '(无标题)'} · ${info.url}（${info.ready}）` : '页面已响应';
-      return { text: `${back ? '已后退' : '已导航'}：${where}` };
+      return { text: `${back ? '已后退' : '已导航'}：${where} ${this.frontNote(front)}`.trimEnd() };
     } catch (err) {
       return fail(this.explain(err, '导航', 'nav'));
     }
@@ -849,12 +1003,24 @@ export class BrowserWorld implements World {
       return fail(this.explain(err, 'tabs'));
     }
     const { changes, sinceMs } = this.collectChanges(targets);
-    const head = targets.length === 0 ? '浏览器里现在没有打开的页面。' : `浏览器里现在有 ${targets.length} 个页面：`;
+    // 专属实例里没有"别人"在浏览：变化段报的是她自己的页面，没有意义，索性不报。
+    const own = this.own !== null;
+    const head = targets.length === 0
+      ? own
+        ? '你自己的浏览器里现在没有打开的页面。'
+        : '浏览器里现在没有打开的页面。'
+      : own
+        ? `你自己的浏览器里现在有 ${targets.length} 个页面：`
+        : `浏览器里现在有 ${targets.length} 个页面：`;
     const lines = targets.map((target) => {
       const mine = this.mine.has(target.targetId) ? '（我开的）' : '';
       return `- ${target.title || '(无标题)'}${mine}\n  ${target.url}\n  target: ${target.targetId}`;
     });
-    return { text: [head, ...lines, renderChanges(changes, sinceMs)].filter((part) => part !== '').join('\n') };
+    return {
+      text: [head, ...lines, own ? '' : renderChanges(changes, sinceMs)]
+        .filter((part) => part !== '')
+        .join('\n'),
+    };
   }
 
   private async close(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {
@@ -877,6 +1043,29 @@ export class BrowserWorld implements World {
     this.mine.delete(target);
     this.seen.delete(target);
     return { text: `已关闭 ${target}。` };
+  }
+
+  private async focus(args: Record<string, unknown>, _ctx: ToolCallContext): Promise<ToolOutcome> {
+    const target = str(args.target);
+    if (!target) return fail('target 是空的：给 browser_open 或 browser_tabs 回的那个 target。');
+    if (!this.own) {
+      return fail(
+        '这个 World 没配专属实例（worlds.browser.ownBrowser），不能把 tab 调到前台：' +
+          '那会抢操作员正在用的那个窗口。要用这个能力，就给她配一个她自己的浏览器实例。',
+      );
+    }
+    if (!this.opts.cfg.bringToFront) {
+      return fail('worlds.browser.bringToFront 关着，本 World 不会把页面带到前台。');
+    }
+    const result = await this.bringToFront(target);
+    if (result === null) return fail('没能把它带到前台。');
+    if ('error' in result) {
+      return fail(
+        `把它调到前台没成功：${result.error}。` +
+          '如果是刚开出来的页面，多半是那个 target 已经不在了——用 browser_tabs 看一眼现在有哪些。',
+      );
+    }
+    return { text: `已把 ${target} 调到前台（document.visibilityState = ${result.visibility || '未知'}）。` };
   }
 
   private async findUrl(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {

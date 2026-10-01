@@ -1,5 +1,5 @@
 import { createServer, type Server } from 'node:http';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,6 +9,7 @@ import { dryMountWorld, fakeWorldContext } from 'cortico/extensions/dry-mount.ts
 import { RelayError, classifyRelayError } from '../src/cdp-client.ts';
 import type { BrowserConfigSection } from '../src/config.ts';
 import { BROWSER } from '../src/definition.ts';
+import { OwnBrowser, chromeProfileDir, devToolsActivePortFile, ownBrowserArgs } from '../src/own-browser.ts';
 import type { BrowserWorld } from '../src/world.ts';
 import { FakeHost } from './helpers/fake-host.ts';
 
@@ -40,6 +41,8 @@ interface FakeProxy {
   evalStatus: number | null;
   /** proxy 在跑但浏览器没连上。 */
   browserDown: boolean;
+  /** `/health` 里报的"实际连着的 CDP 端口"。给 0 表示不报这一项。 */
+  chromePort: number;
   /** `/new` 收到的正文（我们只该发 `about:blank`：建 tab 与导航是两步）。 */
   openBodies: string[];
   /** `/navigate` 收到的地址。 */
@@ -61,6 +64,7 @@ async function fakeProxy(): Promise<FakeProxy> {
     evalReply: () => ({ ok: true, value: null }),
     evalStatus: null,
     browserDown: false,
+    chromePort: 0,
     openBodies: [],
     navBodies: [],
     navDelayMs: 0,
@@ -92,6 +96,7 @@ async function fakeProxy(): Promise<FakeProxy> {
           connected: !state.browserDown,
           browser: { id: 'chrome', label: 'Chrome', source: 'preference' },
           managedTabs: state.pages.length,
+          chromePort: state.chromePort,
         });
         return;
       }
@@ -210,9 +215,40 @@ async function freePort(): Promise<number> {
   return port;
 }
 
+/**
+ * 一个"存在就行"的可执行文件：preflight 只检查它存不存在，不会真去跑它。
+ * （真拉起浏览器那一段由实机冒烟覆盖，见设计记录。）
+ */
+function writeFakeExe(dir: string): string {
+  const file = join(dir, 'chrome.exe');
+  writeFileSync(file, 'not a real browser');
+  return file;
+}
+
+/**
+ * 假的"浏览器自己的调试口"：只回 `/json/version`，也就是我们探活与拿 ws 地址用的那一个口。
+ * 它的 `webSocketDebuggerUrl` 指向它自己——那不是一个真的 WebSocket 服务，所以"调前台"
+ * 会在这里失败，正好用来验失败那条路。
+ */
+async function fakeBrowserCdp(): Promise<{ port: number; wsUrl: string }> {
+  const server = createServer((req, res) => {
+    if ((req.url ?? '').startsWith('/json/version')) {
+      const port = (server.address() as AddressInfo).port;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/browser/FAKE-UUID` }));
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  servers.push(server);
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as AddressInfo).port;
+  return { port, wsUrl: `ws://127.0.0.1:${port}/devtools/browser/FAKE-UUID` };
+}
+
 /** 一个最小的、真的是这个协议的 proxy：给自己拉起那条路当靶子。 */
-function writeProxyScript(dir: string): void {
-  mkdirSync(join(dir, 'scripts'), { recursive: true });
+function writeProxyScript(dir: string): void {  mkdirSync(join(dir, 'scripts'), { recursive: true });
   writeFileSync(
     join(dir, 'scripts', 'cdp-proxy.mjs'),
     [
@@ -253,7 +289,7 @@ describe('Browser World', () => {
     expect(report.failures).toEqual([]);
   });
 
-  it('工具表：十二个工具，都带 browser_ 前缀和非空标签', () => {
+  it('工具表：十三个工具，都带 browser_ 前缀和非空标签', () => {
     const world = startedWorld(3456);
     const tools = world.tools();
     expect(tools.map((tool) => tool.name)).toEqual([
@@ -267,6 +303,7 @@ describe('Browser World', () => {
       'browser_shot',
       'browser_navigate',
       'browser_tabs',
+      'browser_focus',
       'browser_close',
       'browser_find_url',
     ]);
@@ -277,9 +314,19 @@ describe('Browser World', () => {
     }
   });
 
-  it('环境提示词报占位符值：浏览器名', () => {
+  it('环境提示词报占位符值：借他日常那个浏览器时，是"后台 tab"那一种', () => {
     const world = startedWorld(3456, { browser: 'edge' });
-    expect(world.envPromptVars()).toEqual({ 'browser.label': 'Edge' });
+    const vars = world.envPromptVars();
+    expect(vars['browser.label']).toBe('Edge');
+    expect(vars['browser.kind']).toContain('操作员日常');
+    expect(vars['browser.front']).toContain('后台 tab');
+  });
+
+  it('环境提示词：她自己的实例说成"会被带到最前面"', () => {
+    const world = startedWorld(3456, { browser: 'chrome', ownBrowser: true, ownBrowserPort: 9223 });
+    const vars = world.envPromptVars();
+    expect(vars['browser.kind']).toContain('专属实例');
+    expect(vars['browser.front']).toContain('带到最前面');
   });
 
   it('没有子进程时 stop() 是空操作', async () => {
@@ -321,6 +368,44 @@ describe('Browser World', () => {
       const ctx = fakeWorldContext(BROWSER, { scratchDir });
       ctx.persist({ skillDir: scratchDir, browser: 'chrome' });
       expect(() => BROWSER.preflight!(ctx)).not.toThrow();
+    });
+
+    it('开了专属实例但没填程序/目录时，逐条点名', () => {
+      writeProxyScript(scratchDir);
+      const noExe = fakeWorldContext(BROWSER, { scratchDir });
+      noExe.persist({ skillDir: scratchDir, browser: 'chrome', ownBrowser: true });
+      expect(() => BROWSER.preflight!(noExe)).toThrow(/ownBrowserExe 没配/);
+
+      const missingExe = fakeWorldContext(BROWSER, { scratchDir });
+      missingExe.persist({
+        skillDir: scratchDir,
+        browser: 'chrome',
+        ownBrowser: true,
+        ownBrowserExe: join(scratchDir, '没有这个.exe'),
+      });
+      expect(() => BROWSER.preflight!(missingExe)).toThrow(/不存在/);
+
+      const noHome = fakeWorldContext(BROWSER, { scratchDir });
+      noHome.persist({
+        skillDir: scratchDir,
+        browser: 'chrome',
+        ownBrowser: true,
+        ownBrowserExe: writeFakeExe(scratchDir),
+      });
+      expect(() => BROWSER.preflight!(noHome)).toThrow(/ownBrowserHome 没配/);
+    });
+
+    it('专属实例只认 chrome：指了别的浏览器就拦下', () => {
+      writeProxyScript(scratchDir);
+      const ctx = fakeWorldContext(BROWSER, { scratchDir });
+      ctx.persist({
+        skillDir: scratchDir,
+        browser: 'edge',
+        ownBrowser: true,
+        ownBrowserExe: writeFakeExe(scratchDir),
+        ownBrowserHome: join(scratchDir, 'home'),
+      });
+      expect(() => BROWSER.preflight!(ctx)).toThrow(/只拉了 Chrome/);
     });
   });
 
@@ -769,5 +854,117 @@ describe('失败归类（决定回执贴哪句话）', () => {
     expect(classifyRelayError(new RelayError('Chrome 未开启远程调试端口', 500))).toBe('not-connected');
     expect(classifyRelayError(new RelayError('WebSocket 未连接', 500))).toBe('not-connected');
     expect(classifyRelayError(new RelayError('未知端点 /x', 404))).toBe('relay');
+  });
+});
+
+/**
+ * 她自己的浏览器实例（2026-10-01 加）。
+ *
+ * 这一组钉的是**决策与 HTTP 那半**：启动参数齐不齐、发现文件写到哪儿、实例已在跑时复用、
+ * 以及"开页之后确实去调了前台"。
+ *
+ * 真拉起一个浏览器、以及裸 WebSocket 上的 `Target.activateTarget` 本身，单测不覆盖——
+ * 那两段由 `pnpm smoke` 对着真的 Chrome 跑（见设计记录「验证」一节）。
+ */
+describe('她自己的浏览器实例', () => {
+  /** 一份"配齐了"的专属实例配置，指向用例自己起的假浏览器口。 */
+  function ownPatch(cdpPort: number): Partial<BrowserConfigSection> {
+    return {
+      skillDir: scratchDir,
+      browser: 'chrome',
+      ownBrowser: true,
+      ownBrowserExe: writeFakeExe(scratchDir),
+      ownBrowserHome: join(scratchDir, 'home'),
+      ownBrowserPort: cdpPort,
+    };
+  }
+
+  it('启动参数：让"前台能播"的那几条都在（谁删掉谁负责）', () => {
+    const args = ownBrowserArgs({ exePath: 'chrome.exe', home: 'H', cdpPort: 9223 });
+    expect(args).toContain(`--user-data-dir=${chromeProfileDir('H')}`);
+    expect(args).toContain('--remote-debugging-port=9223');
+    expect(args).toContain('--remote-allow-origins=*');
+    expect(args).toContain('--autoplay-policy=no-user-gesture-required');
+    expect(args).toContain('--disable-background-timer-throttling');
+    expect(args.some((arg) => arg.includes('CalculateNativeWinOcclusion'))).toBe(true);
+    expect(args).toContain('--no-first-run');
+  });
+
+  it('发现文件的位置：照 Chrome 自己的布局放在她的"家"里', () => {
+    expect(chromeProfileDir('H')).toBe(join('H', 'Google', 'Chrome', 'User Data'));
+    expect(devToolsActivePortFile('H')).toBe(join('H', 'Google', 'Chrome', 'User Data', 'DevToolsActivePort'));
+  });
+
+  it('实例已经在跑时：复用它（不 spawn），并把发现文件刷新成它现在的端口与 ws 路径', async () => {
+    const cdp = await fakeBrowserCdp();
+    const home = join(scratchDir, 'home');
+    const own = new OwnBrowser({ exePath: writeFakeExe(scratchDir), home, cdpPort: cdp.port });
+
+    expect(await own.ensure(new FakeHost().log, 3000)).toBeNull();
+    expect(own.owned).toBe(false); // 复用来的，不该被当成"自己拉起的"
+
+    const lines = readFileSync(devToolsActivePortFile(home), 'utf8').split('\n').filter((line) => line !== '');
+    expect(lines[0]).toBe(String(cdp.port));
+    expect(lines[1]).toBe('/devtools/browser/FAKE-UUID');
+  });
+
+  it('探不到实例、程序又不在时，把原因说清楚（不抛错）', async () => {
+    const free = await freePort();
+    const own = new OwnBrowser({
+      exePath: join(scratchDir, '没有这个.exe'),
+      home: join(scratchDir, 'home'),
+      cdpPort: free,
+    });
+    const problem = await own.ensure(new FakeHost().log, 1500);
+    expect(problem).toContain('不存在');
+  });
+
+  it('proxy 连的不是她那个实例：当场说清，不静默去动别人的浏览器', async () => {
+    const proxy = await fakeProxy();
+    const cdp = await fakeBrowserCdp();
+    proxy.chromePort = 9222; // 假 proxy 说它连的是别处
+    const world = startedWorld(proxy.port, ownPatch(cdp.port));
+    const host = new FakeHost();
+    await world.start(host);
+
+    expect(host.events.map((event) => event.type)).toEqual(['browser.down']);
+    expect(host.events[0].text).toContain('不是她自己的那个');
+  });
+
+  it('专属实例里 browser_tabs 说"你自己的浏览器"，也不报变化段', async () => {
+    const proxy = await fakeProxy();
+    const cdp = await fakeBrowserCdp();
+    proxy.chromePort = cdp.port;
+    proxy.pages.push({ targetId: 'T9', url: 'https://example.com/', title: '甲' });
+    const world = startedWorld(proxy.port, ownPatch(cdp.port));
+    await world.start(new FakeHost());
+
+    const out = await call(world, 'browser_tabs');
+    expect(out.text).toContain('你自己的浏览器');
+    expect(out.text).not.toContain('[变化]');
+  });
+
+  it('没配专属实例时 browser_focus 拒绝，并说清为什么', async () => {
+    const proxy = await fakeProxy();
+    const world = startedWorld(proxy.port, { skillDir: scratchDir });
+    await world.start(new FakeHost());
+
+    const out = await call(world, 'browser_focus', { target: 'T1' });
+    expect(out.failed).toBe(true);
+    expect(out.text).toContain('没配专属实例');
+  });
+
+  it('开页之后会去调前台；调不成时在回执里说明，而不是当作失败', async () => {
+    const proxy = await fakeProxy();
+    const cdp = await fakeBrowserCdp(); // 它的 ws 地址不是真的 WebSocket 服务
+    proxy.chromePort = cdp.port;
+    proxy.evalReply = () => PAGE_DUMP;
+    const world = startedWorld(proxy.port, ownPatch(cdp.port));
+    await world.start(new FakeHost());
+
+    const out = await call(world, 'browser_open', { url: 'example.com/a' });
+    expect(out.failed).toBeFalsy();
+    expect(out.text).toContain('已打开');
+    expect(out.text).toContain('没能把这个页面带到前台');
   });
 });

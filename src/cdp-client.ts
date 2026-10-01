@@ -29,6 +29,8 @@ export interface RelayHealth {
   browserId: string;
   browserLabel: string;
   managedTabs: number;
+  /** proxy 实际连的是哪个 CDP 端口。开了专属实例时用它核对「连的是不是我拉的那个」。 */
+  chromePort: number;
 }
 
 export type EvalResult = { ok: true; value: unknown } | { ok: false; error: string };
@@ -70,6 +72,14 @@ export interface CdpRelayOptions {
   browser: string;
   port: number;
   tabIdleMinutes: number;
+  /**
+   * 起了专属实例时：把它当 `LOCALAPPDATA` 交给 proxy 子进程。
+   *
+   * 上游 `browser-discovery` 是按 `LOCALAPPDATA/Google/Chrome/User Data/DevToolsActivePort`
+   * 找浏览器的；重定向之后它找的就是**她那个实例的发现文件**，于是上游照旧认为自己在操作
+   * "Chrome"，而操作员日常那个 Edge 连碰都不用碰。不设时行为与原来一模一样。
+   */
+  localAppDataRoot?: string;
 }
 
 const PROBE_TIMEOUT_MS = 2000;
@@ -112,6 +122,7 @@ export class CdpRelay {
         connected?: unknown;
         browser?: { id?: unknown; label?: unknown } | null;
         managedTabs?: unknown;
+        chromePort?: unknown;
       };
       if (body.status !== 'ok') return null;
       return {
@@ -119,6 +130,7 @@ export class CdpRelay {
         browserId: typeof body.browser?.id === 'string' ? body.browser.id : '',
         browserLabel: typeof body.browser?.label === 'string' ? body.browser.label : '',
         managedTabs: typeof body.managedTabs === 'number' ? body.managedTabs : 0,
+        chromePort: typeof body.chromePort === 'number' ? body.chromePort : 0,
       };
     } catch {
       return null;
@@ -163,11 +175,13 @@ export class CdpRelay {
 
   /** 拉起 proxy。失败时把原因留在 `failure` 里，返回 false。 */
   spawnProxy(log: Logger): boolean {    const script = this.scriptPath('cdp-proxy.mjs');
-    const env = {
+    const env: NodeJS.ProcessEnv = {
       ...process.env,
       CDP_PROXY_PORT: String(this.opts.port),
       CDP_TAB_IDLE_TIMEOUT: String(Math.max(1, Math.round(this.opts.tabIdleMinutes * 60_000))),
     };
+    const root = this.opts.localAppDataRoot?.trim();
+    if (root) env.LOCALAPPDATA = root;
     try {
       const child = spawn(process.execPath, [script, '--browser', this.opts.browser], {
         cwd: this.opts.skillDir,
@@ -437,14 +451,21 @@ export async function runFindUrl(
   skillDir: string,
   args: readonly string[],
   timeoutMs: number,
+  localAppDataRoot?: string,
 ): Promise<{ ok: boolean; output: string }> {
   const script = join(skillDir, 'scripts', 'find-url.mjs');
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  // 起了专属实例时，它同样按 LOCALAPPDATA 找书签与历史：重定向之后查的是**她自己那个
+  // profile**（她的历史现在是她自己的，不是操作员的了）。
+  const root = localAppDataRoot?.trim();
+  if (root) env.LOCALAPPDATA = root;
   return new Promise((resolve) => {
     let done = false;
     let out = '';
     let err = '';
     const child = spawn(process.execPath, [script, ...args], {
       cwd: skillDir,
+      env,
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
     });

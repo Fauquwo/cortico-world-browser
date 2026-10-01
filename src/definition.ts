@@ -34,6 +34,31 @@ export const BROWSER: WorldDefinition<BrowserConfigSection> = {
     if (!BROWSERS.includes(browser)) {
       throw new Error(`worlds.browser.browser 只能是 ${BROWSERS.join(' / ')}，现在是「${browser}」。`);
     }
+    // 专属实例那几项：开着就必须填全，漏什么在这里点名，别等运行起来才发现她没手。
+    if (ctx.cfg.ownBrowser) {
+      const exe = ctx.cfg.ownBrowserExe.trim();
+      if (!exe) {
+        throw new Error(
+          'worlds.browser.ownBrowser 开着，但 ownBrowserExe 没配。' +
+            '填浏览器可执行文件的绝对路径，例如 C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe。',
+        );
+      }
+      if (!existsSync(exe)) {
+        throw new Error(`worlds.browser.ownBrowserExe 指向的文件不存在：${exe}`);
+      }
+      if (!ctx.cfg.ownBrowserHome.trim()) {
+        throw new Error(
+          'worlds.browser.ownBrowser 开着，但 ownBrowserHome 没配。' +
+            '给她一个放 profile 的目录（建议工作区内，例如 <工作区>\\state\\browser-home）。',
+        );
+      }
+      if (browser !== 'chrome') {
+        throw new Error(
+          `worlds.browser.ownBrowser 只拉了 Chrome（现在 browser = 「${browser}」）。` +
+            '专属实例的发现文件写在 Chrome 的布局下，指别的浏览器找不到它。',
+        );
+      }
+    }
   },
 
   // `ctx.cfg` 是 `worlds.browser` 的活引用：热改的键现读即生效。
