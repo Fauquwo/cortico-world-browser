@@ -790,12 +790,13 @@ export class BrowserWorld implements World {
       name: 'browser_focus',
       description:
         'Bring one of your pages into the operator\'s view: its window is moved back on screen and raised above ' +
-        'whatever he is using (no keyboard focus is taken). Use it when you actually want him to look at ' +
-        'something. This is the only tool that takes over his screen, so reach for it deliberately — your pages ' +
-        'work fine, media included, while they stay off screen, and this interrupts whatever he is doing. The ' +
-        'receipt tells you the page\'s document.visibilityState afterwards, and whether the window really ended ' +
-        'up above the program he was using — if it says it did not, he cannot see it (a program in exclusive ' +
-        'fullscreen cannot be covered by anything) and browser_shot is the reliable way to show him instead.',
+        'whatever he is using. Use it when you actually want him to look at something. This is the only tool ' +
+        'that takes over his screen, so reach for it deliberately — your pages work fine, media included, while ' +
+        'they stay off screen, and this interrupts whatever he is doing (his keyboard focus usually stays where ' +
+        'it was, but that is not guaranteed). The receipt tells you the page\'s document.visibilityState ' +
+        'afterwards, and whether the window really ended up above the program he was using — if it says it did ' +
+        'not, he cannot see it (a program in exclusive fullscreen cannot be covered by anything) and browser_shot ' +
+        'is the reliable way to show him instead.',
       tags: ['act'],
       parameters: {
         type: 'object',

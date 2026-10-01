@@ -15,8 +15,10 @@
  *      放在"普通层的最上面"，于是它仍然盖着他那个窗口，而**不会永久霸着最上层**
  *      （他点别的程序，那个程序自然又回到上面来）。
  *
- * **不调 `SetForegroundWindow`**：键盘焦点不该被拿走（量到那条本来也会被 Windows 的前台锁
- * 拒掉：同一个探针里它返回 false，而窗口照样到了最上面）。看见她要给的东西不需要焦点。
+ * **不调 `SetForegroundWindow`**：那一句量到会被 Windows 的前台锁当场拒掉（返回 `false`），
+ * 而窗口照样到了最上面——"看见"不需要焦点。再加上 `SWP_NOACTIVATE`（不带它时 `SetWindowPos`
+ * 会顺手激活窗口）。但**"不抢焦点"不是保证**：带上旗子之后专门量了三轮（前台全程是他的窗口），
+ * 随后一次完整冒烟里前台还是落到了她那儿。我们做的是 z 序，不是"绝不打扰"。
  *
  * 量与抬都在同一个 PowerShell 进程里做完，回执里带**抬完之后的真实相对位置**——失败了就说
  * 失败，不写"他已经看得见了"这种话（上一版就是这么写的，而他看不到）。
@@ -66,7 +68,11 @@ public class CorticoRaiseW {
 
 $targetPid = [int]$env:CORTICO_RAISE_PID
 $titleLike = [string]$env:CORTICO_RAISE_TITLE
-$swp = 0x0002 -bor 0x0001 -bor 0x0040
+# SWP_NOSIZE|SWP_NOMOVE|SWP_SHOWWINDOW|SWP_NOACTIVATE。
+# 最后那面旗是量出来的：不带它的时候，SetWindowPos 会**顺手把这个窗口激活**（两次冒烟里有一次
+# 前台就变成了她自己那个窗口）。带上是"只改 z 序、不动激活"。三轮专门量的都没抢焦点，
+# 但一次完整冒烟里还是抢到了——所以这是"少抢"，不是"不抢"。
+$swp = 0x0002 -bor 0x0001 -bor 0x0040 -bor 0x0010
 $topmost = [IntPtr]::new(-1)
 $notTopmost = [IntPtr]::new(-2)
 
@@ -90,7 +96,7 @@ $h = [CorticoRaiseW]::GetTopWindow([IntPtr]::Zero)
 while ($h -ne [IntPtr]::Zero) {
   $p = 0
   [void][CorticoRaiseW]::GetWindowThreadProcessId($h, [ref]$p)
-  if ($p -eq $targetPid -and [CorticoRaiseW]::IsWindowVisible($h) -and (Get-Class $h).StartsWith('Chrome_WidgetWin')) {
+  if ($p -eq $targetPid -and [CorticoRaiseW]::IsWindowVisible($h) -and ((Get-Class $h) -like 'Chrome_WidgetWin*')) {
     $t = Get-Text $h
     if ($titleLike -ne '' -and $t.Contains($titleLike)) { $found = $h; break }
     if ($fallback -eq [IntPtr]::Zero -and $t -ne '') { $fallback = $h }
@@ -210,8 +216,13 @@ export async function raiseBrowserWindow(opts: {
   });
 }
 
-/** 从 PowerShell 的输出里挑出那行 JSON（前面可能有别的噪声行）。 */
-function parseRaiseOutput(stdout: string): Omit<RaiseResult, 'attempted'> | null {
+/** 脚本里那些短原因码要说成人话——回执是给她（和调试的我）读的。 */
+const WHY_IN_WORDS: Record<string, string> = {
+  'no-window': '没找到她那个浏览器窗口（这一页的标题可能已经变了，或者窗口被关掉了）',
+};
+
+/** 从 PowerShell 的输出里挑出那行 JSON（前面可能有别的噪声行）。导出只为让单测能钉住这里的映射。 */
+export function parseRaiseOutput(stdout: string): Omit<RaiseResult, 'attempted'> | null {
   const lines = stdout
     .split('\n')
     .map((line) => line.trim())
@@ -219,10 +230,11 @@ function parseRaiseOutput(stdout: string): Omit<RaiseResult, 'attempted'> | null
   for (const line of lines.reverse()) {
     try {
       const raw = JSON.parse(line) as { ok?: unknown; aboveForeground?: unknown; why?: unknown; foregroundTitle?: unknown };
+      const why = typeof raw.why === 'string' ? raw.why : '';
       return {
         ok: raw.ok === true,
         aboveForeground: raw.aboveForeground === true,
-        why: typeof raw.why === 'string' ? raw.why : '',
+        why: why === '' ? '' : (WHY_IN_WORDS[why] ?? why),
         foregroundTitle: typeof raw.foregroundTitle === 'string' ? raw.foregroundTitle : '',
       };
     } catch {
