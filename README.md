@@ -21,11 +21,12 @@ bot 能在浏览器里开页、读页、点击、填表、上传、滚动、截�
 | `src/config.ts` | 配置段类型、默认值、控制台配置组 |
 | `src/world.ts` | `World` 实现：起停、十三个工具、`console()` |
 | `src/cdp-client.ts` | cdp-proxy 的客户端：起停子进程、HTTP 调用、`find-url.mjs` |
-| `src/own-browser.ts` | 她自己的实例：起停、写发现文件、直接说 CDP（`Target.activateTarget`） |
+| `src/own-browser.ts` | 她自己的实例：起停、写发现文件、直接说 CDP（建窗口 / 激活 / 搬窗口） |
+| `src/window-raise.ts` | "搬到他眼前"的最后一步：抬 z 序（CDP 做不到，交给 Windows 的 `SetWindowPos`） |
 | `src/page-scripts.ts` | 注入页面执行的 JS：读页（穿 Shadow DOM 与 iframe）、填表 |
 | `src/ENV_PROMPT.md` | 环境提示词模板，占位符 `{{browser.label}}` / `{{browser.kind}}` / `{{browser.front}}` |
-| `scripts/smoke.ts` | 开发用冒烟：对着真的 proxy 走一遍开页、读页、截图；`--own` 时含"能不能播" |
-| `tests/` | 干装载、起停、工具回执、变化聚合、专属实例；假 proxy 是一个真的 HTTP 服务 |
+| `scripts/smoke.ts` | 开发用冒烟：对着真的 proxy 走一遍开页、读页、截图；`--own` 时含"能不能播"与"抬不抬得起来" |
+| `tests/` | 干装载、起停、工具回执、变化聚合、专属实例、focus 回执话术；假 proxy 是一个真的 HTTP 服务 |
 
 ## 配置
 
@@ -81,9 +82,29 @@ bot 能在浏览器里开页、读页、点击、填表、上传、滚动、截�
 那个只建后台 tab），实例启动时带 `--window-position=-32000,-32000`，于是这些窗口都在屏幕外：
 媒体照播、截图照截、不抢焦点、不挡他。
 
-要打断他时才搬回来：`browser_focus` = `Browser.setWindowBounds`（回屏幕内）+ `Target.activateTarget`。
-上游 13 个端点里没有这几个，所以 `own-browser.ts` 直连浏览器自己的 WebSocket（Node 22 原生
-`WebSocket`，不加依赖）。
+要打断他时才搬回来：`browser_focus` = `Browser.setWindowBounds`（回屏幕内）+ `Target.activateTarget`
++ 抬 z 序（下一节）。上游 13 个端点里没有前两个，所以 `own-browser.ts` 直连浏览器自己的 WebSocket
+（Node 22 原生 `WebSocket`，不加依赖）。
+
+## "搬到他眼前"里，抬窗口那一步（2026-10-02 加的）
+
+2026-10-02 他报「她想展示到我屏幕上时，如果别的应用占着屏幕，我看不到 Chrome」。量到的实底：
+上面那两件（`setWindowBounds` + `activateTarget`）**都不改 z 序**，所以窗口回到屏幕内之后仍然压在
+他正在用的程序底下（z 序 35 对前台 30），而他拿到的回执写着「他现在看得见这个页面了」——**是回执
+在说谎**。`Browser.*` 域里没有 z 序/置顶这一项，所以这一步走出进程（`src/window-raise.ts`）：
+
+1. 按「同一个 PID + 类名 `Chrome_WidgetWin*` + 标题里含这一页的标题」认出她那个窗口
+   （只看 PID 会把"要恢复页面吗？"那种对话框一起抬上来）；
+2. `SetWindowPos(HWND_TOPMOST)` → `SetWindowPos(HWND_NOTOPMOST)`：先走到所有窗口（含占着屏幕的那个）
+   之上，再落到**普通层的最上面**——看得见，但不会永久霸着最上层（他一点别的程序，那个程序回到上面）；
+3. **不调 `SetForegroundWindow`**（量到它当场返回 `false`：Windows 的前台锁不认后台进程，而窗口照样
+   到了最上面）⇒ 他的键盘焦点不被拿走；
+4. 抬完当场量一次 z 序，回执按**量到的结果**说话：抬上去了才说「看得见」；被独占全屏那种程序挡住时
+   直说，并让她改用 `browser_shot` 截图。
+
+代价：这一步多花约 950 毫秒（一次 PowerShell + P/Invoke 编译）。只在 `browser_focus` 这条罕见路径上，
+没去优化。没量清的写在 `state/design/cortico-world-browser.md`（独占全屏、多显示器、一个窗口里多 tab
+且要展示的不是活动 tab）。
 
 上游的 `tabIdleMinutes`（闲置自动关页）管不到这些窗口——上游不认识我们直连建的窗口，所以本 World
 自己补了一份回收（每次工具调用顺便扫一眼，不挂定时器）。
