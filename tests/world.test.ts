@@ -51,6 +51,8 @@ interface FakeProxy {
   navDelayMs: number;
   /** 设了就让 `/navigate` 回这个状态码 + `CDP 命令超时: Page.navigate`（站点打不开的现场）。 */
   navStatus: number | null;
+  /** 设了就让 `/click` 或 `/clickAt` 顺手开出一张新页面（`target=_blank` 链接的现场）。 */
+  clickOpens: { url: string; title: string } | null;
   evalBodies: string[];
   hits: string[];
   closed: string[];
@@ -69,6 +71,7 @@ async function fakeProxy(): Promise<FakeProxy> {
     navBodies: [],
     navDelayMs: 0,
     navStatus: null,
+    clickOpens: null,
     evalBodies: [],
     hits: [],
     closed: [],
@@ -133,6 +136,10 @@ async function fakeProxy(): Promise<FakeProxy> {
         return;
       }
       if (path === '/click' || path === '/clickAt') {
+        if (state.clickOpens) {
+          seq += 1;
+          state.pages.push({ targetId: `T${seq}`, url: state.clickOpens.url, title: state.clickOpens.title });
+        }
         json({ clicked: true, tag: 'button', text: '提交' });
         return;
       }
@@ -289,11 +296,12 @@ describe('Browser World', () => {
     expect(report.failures).toEqual([]);
   });
 
-  it('工具表：十三个工具，都带 browser_ 前缀和非空标签', () => {
+  it('工具表：十四个工具，都带 browser_ 前缀和非空标签', () => {
     const world = startedWorld(3456);
     const tools = world.tools();
     expect(tools.map((tool) => tool.name)).toEqual([
       'browser_open',
+      'browser_search',
       'browser_read',
       'browser_js',
       'browser_click',
@@ -1031,5 +1039,173 @@ describe('她自己的浏览器实例', () => {
     await sleep(20);
     await call(world, 'browser_tabs'); // 任何一次工具调用都会顺手扫一遍
     expect(proxy.closed).toContain(target);
+  });
+});
+
+/**
+ * 「搜」这一步（2026-10-12 加的）。她的原话是「浏览器给我的是打开这个地址、读正文，没有搜这一步，
+ * 主题一模糊我就只剩猜域名、翻站内导航两条路」——这组测试盯的就是：回执交出去的必须是**地址**。
+ */
+describe('搜索', () => {
+  /** 抽取表达式长这样：`(spec) => {...})({"id":"bing","anchors":[...`。 */
+  function isHarvest(expression: string): boolean {
+    return expression.includes('"anchors":[');
+  }
+
+  const HITS = {
+    anchors: 10,
+    title: '怎么挑机械键盘 - 搜索',
+    url: 'https://cn.bing.com/search?q=%E6%80%8E%E4%B9%88%E6%8C%91%E6%9C%BA%E6%A2%B0%E9%94%AE%E7%9B%98',
+    hits: [
+      {
+        title: '机械键盘推荐：青轴、红轴、黑轴、茶轴怎么选？ - 知乎',
+        url: 'https://zhuanlan.zhihu.com/p/257307801',
+        snippet: '2024年10月23日 · 机械键盘推荐，为什么要选用机械键盘？',
+        source: '知乎专栏',
+      },
+      {
+        title: '2026年机械键盘怎么选？我从200到1500全试了一遍',
+        url: 'https://zhuanlan.zhihu.com/p/2045432457407854349',
+        snippet: '',
+        source: '知乎专栏',
+      },
+    ],
+  };
+
+  it('browser_search：一次调用给出候选地址，并说清下一步怎么用', async () => {
+    const proxy = await fakeProxy();
+    proxy.evalReply = (expression) => (isHarvest(expression) ? { ok: true, value: HITS } : PAGE_DUMP);
+    const world = startedWorld(proxy.port, { skillDir: scratchDir });
+    await world.start(new FakeHost());
+
+    const out = await call(world, 'browser_search', { query: '怎么挑机械键盘' });
+    expect(out.failed).toBeFalsy();
+    expect(out.text).toContain('Bing 国内版');
+    expect(out.text).toContain('2 条');
+    expect(out.text).toContain('https://zhuanlan.zhihu.com/p/257307801');
+    expect(out.text).toContain('[知乎专栏]');
+    expect(out.text).toContain('2024年10月23日');
+    // 最要紧的一句：拿到的是地址，用 browser_open 开，别去点结果页上的链接。
+    expect(out.text).toContain('browser_open');
+    expect(out.text).toContain('别去点结果页上的链接');
+    // 关键词进了结果页地址（URL 编码过）。
+    expect(proxy.navBodies.at(-1)).toContain('cn.bing.com/search?q=');
+    expect(proxy.navBodies.at(-1)).toContain(encodeURIComponent('怎么挑机械键盘'));
+    // 结果页留给她：回执里有 target，browser_close 认它。
+    const target = /target (T\d+)/.exec(out.text)?.[1] ?? '';
+    expect(target).not.toBe('');
+    const closed = await call(world, 'browser_close', { target });
+    expect(closed.failed).toBeFalsy();
+  });
+
+  it('browser_search：换引擎走那个引擎的结果页，跳转链接会被标出来', async () => {
+    const proxy = await fakeProxy();
+    proxy.evalReply = (expression) =>
+      isHarvest(expression)
+        ? {
+            ok: true,
+            value: {
+              anchors: 8,
+              title: '怎么挑机械键盘 - 搜狗搜索',
+              url: 'https://www.sogou.com/web?query=x',
+              hits: [{ title: '机械键盘选购从小白到入门 - 知乎', url: 'https://www.sogou.com/link?url=hedJjaC291', snippet: '轴体结构很稳定', source: '' }],
+            },
+          }
+        : PAGE_DUMP;
+    const world = startedWorld(proxy.port, { skillDir: scratchDir });
+    await world.start(new FakeHost());
+
+    const out = await call(world, 'browser_search', { query: '机械键盘', engine: 'sogou' });
+    expect(out.text).toContain('搜狗');
+    expect(proxy.navBodies.at(-1)).toContain('sogou.com/web?query=');
+    expect(out.text).toContain('（跳转链接）');
+    expect(out.text).toContain('看不出是哪个站点');
+  });
+
+  it('browser_search：一条都没抽到时退回整页正文，并说清是哪种没命中', async () => {
+    const proxy = await fakeProxy();
+    proxy.evalReply = (expression) =>
+      isHarvest(expression) ? { ok: true, value: { anchors: 0, hits: [], title: '验证', url: 'https://cn.bing.com/verify' } } : PAGE_DUMP;
+    const world = startedWorld(proxy.port, { skillDir: scratchDir });
+    await world.start(new FakeHost());
+
+    const out = await call(world, 'browser_search', { query: '机械键盘' });
+    expect(out.failed).toBeFalsy(); // 抽取没命中不算失败：退路是给整页正文
+    expect(out.text).toContain('一条都没抽出来');
+    expect(out.text).toContain('换了页面结构');
+    expect(out.text).toContain('这是一段正文'); // 退回来的整页正文
+  });
+
+  it('browser_search：query 空着时直接失败；引擎名不认识时落到配置的默认值', async () => {
+    const proxy = await fakeProxy();
+    proxy.evalReply = (expression) => (isHarvest(expression) ? { ok: true, value: HITS } : PAGE_DUMP);
+    const world = startedWorld(proxy.port, { skillDir: scratchDir, searchEngine: 'sogou' });
+    await world.start(new FakeHost());
+
+    const blank = await call(world, 'browser_search', {});
+    expect(blank.failed).toBe(true);
+    expect(blank.text).toContain('query 是空的');
+
+    const out = await call(world, 'browser_search', { query: '机械键盘', engine: 'google' });
+    expect(proxy.navBodies.at(-1)).toContain('sogou.com/web?query='); // 认不出的名字不生效，走配置
+    expect(out.text).toContain('搜狗');
+  });
+});
+
+describe('点击开出来的新页面（2026-10-12 加的）', () => {
+  it('真鼠标点开一张新页面时写进回执；借他那个浏览器时不登记成她的（怕认下他自己开的）', async () => {
+    const proxy = await fakeProxy();
+    proxy.clickOpens = { url: 'https://zhuanlan.zhihu.com/p/257307801', title: '机械键盘推荐' };
+    const world = startedWorld(proxy.port, { skillDir: scratchDir });
+    await world.start(new FakeHost());
+
+    const out = await call(world, 'browser_click', {
+      target: 'T1',
+      selector: '#b_results > li.b_algo h2 a',
+      native: true,
+    });
+    expect(out.text).toContain('点击开出了一张新页面');
+    expect(out.text).toContain('https://zhuanlan.zhihu.com/p/257307801');
+    expect(out.text).toContain('没有登记成我开的');
+    // 没登记就不该替她关：这条回执不能让她以为能关。
+    const target = /target: (T\d+)/.exec(out.text)?.[1] ?? '';
+    expect(target).not.toBe('');
+    const refused = await call(world, 'browser_close', { target });
+    expect(refused.failed).toBe(true);
+    expect(refused.text).toContain('不是我开的');
+  });
+
+  it('专属实例里点开的新页面登记成她的：能关、也会被闲置回收', async () => {
+    const proxy = await fakeProxy();
+    const cdp = await fakeBrowserCdp();
+    proxy.chromePort = cdp.port;
+    proxy.clickOpens = { url: 'https://zhuanlan.zhihu.com/p/257307801', title: '机械键盘推荐' };
+    const world = startedWorld(proxy.port, {
+      skillDir: scratchDir,
+      browser: 'chrome',
+      ownBrowser: true,
+      ownBrowserExe: writeFakeExe(scratchDir),
+      ownBrowserHome: join(scratchDir, 'home'),
+      ownBrowserPort: cdp.port,
+      tabIdleMinutes: 0.00005,
+    });
+    await world.start(new FakeHost());
+
+    const out = await call(world, 'browser_click', { target: 'T1', selector: 'a.result', native: true });
+    expect(out.text).toContain('点击开出了一张新页面');
+    expect(out.text).toContain('已经记成我开的');
+    const target = /target: (T\d+)/.exec(out.text)?.[1] ?? '';
+    expect(target).not.toBe('');
+    const closed = await call(world, 'browser_close', { target });
+    expect(closed.failed).toBeFalsy();
+  });
+
+  it('没开出新页面时，回执一个字都不多写', async () => {
+    const proxy = await fakeProxy();
+    const world = startedWorld(proxy.port, { skillDir: scratchDir });
+    await world.start(new FakeHost());
+
+    const out = await call(world, 'browser_click', { target: 'T1', selector: 'button.submit' });
+    expect(out.text).not.toContain('新页面');
   });
 });

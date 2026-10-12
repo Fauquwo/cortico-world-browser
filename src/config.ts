@@ -1,4 +1,5 @@
 import type { ConfigGroup } from 'cortico/core/types.ts';
+import { SEARCH_ENGINE_DEFAULT, type SearchEngineId } from './search.ts';
 
 /**
  * config.json 的 worlds.browser 段，默认禁用；bot 或部署可启用。
@@ -58,6 +59,14 @@ export interface BrowserConfigSection {
    * 这一项管的是"她可不可以打扰他"——关掉之后 `browser_focus` 会拒绝并说清。
    */
   bringToFront: boolean;
+  /**
+   * `browser_search` 默认用哪个搜索引擎（`bing` / `sogou` / `baidu`）。
+   *
+   * 2026-10-12 在这台机器上量到：Google 与 DuckDuckGo **打不开**，能用的是这三个。
+   * 默认 Bing 国内版，因为只有它把**真地址**给出来（搜狗与百度给的是它们自己的跳转链接，
+   * 从地址上看不出是哪个站点）。她调工具时可以用 `engine` 参数临时换一个。
+   */
+  searchEngine: SearchEngineId;
 }
 
 export const BROWSER_DEFAULTS: BrowserConfigSection = {
@@ -73,6 +82,7 @@ export const BROWSER_DEFAULTS: BrowserConfigSection = {
   ownBrowserHome: '',
   ownBrowserPort: 9223,
   bringToFront: true,
+  searchEngine: SEARCH_ENGINE_DEFAULT,
 };
 
 /** World 配置的 JSON Schema 声明。 */
@@ -155,6 +165,17 @@ export const BROWSER_CONFIG_GROUP: ConfigGroup = {
           '注意这不是"页面能不能播"的开关——她的页面平时停在屏幕外，媒体照样播、也不会打扰你；' +
           '这一项只管"她能不能打断你"。关掉之后她调那个工具会被拒绝并说明原因。改完要重启这个 World 才生效。',
         'x-hot': false,
+      },
+      'worlds.browser.searchEngine': {
+        type: 'string',
+        title: '搜索用哪个引擎',
+        description:
+          'browser_search 默认用哪个：bing（国内版，默认）/ sogou / baidu。' +
+          '这台机器上 Google 与 DuckDuckGo 打不开，别选它们。' +
+          'Bing 给的是真地址；搜狗与百度给的是它们自己的跳转链接（打开会落到真页，但从地址上看不出站点）。' +
+          '她可以按次用 engine 参数覆盖这一项，所以这里只是默认值。',
+        enum: ['bing', 'sogou', 'baidu'],
+        'x-hot': true,
       },
     },
   },

@@ -26,6 +26,18 @@ import { BROWSER_CONFIG_GROUP, type BrowserConfigSection } from './config.ts';
 import { OwnBrowser, createWindow, showTarget } from './own-browser.ts';
 import { raiseSentence, type RaiseResult } from './window-raise.ts';
 import { readExpression, typeExpression } from './page-scripts.ts';
+import {
+  SEARCH_COUNT_DEFAULT,
+  SEARCH_COUNT_MAX,
+  SEARCH_ENGINE_DEFAULT,
+  clampCount,
+  isSearchEngineId,
+  normalizeHarvest,
+  renderSearch,
+  searchExpression,
+  searchUrl,
+  type SearchEngineId,
+} from './search.ts';
 
 const ENV_PROMPT_FILE = fileURLToPath(new URL('./ENV_PROMPT.md', import.meta.url));
 
@@ -541,6 +553,7 @@ export class BrowserWorld implements World {
   tools(): ToolDef[] {
     const defs: ToolDef[] = [
       this.openTool(),
+      this.searchTool(),
       this.readTool(),
       this.jsTool(),
       this.clickTool(),
@@ -584,6 +597,42 @@ export class BrowserWorld implements World {
         required: ['url'],
       },
       handler: async (args, ctx) => this.open(args, ctx),
+    };
+  }
+
+  /**
+   * 搜索：把关键词变成一批**地址**。
+   *
+   * 2026-10-12 加这一条，起因是她的原话：「浏览器给我的是打开这个地址、读正文，没有『搜』这一步，
+   * 主题一模糊我就只剩猜域名、翻站内导航两条路。」所以这个工具回的不是一个页面正文，
+   * 而是**能继续开的候选地址**——她拿到地址就用 `browser_open` 开，不点结果页上的链接。
+   * 为什么不点：结果链接都是 `target=_blank`，程序化点击（`browser_click` 默认那条）开不出新页面，
+   * 6 里量到过「JS 点击 → 新页面 0 个，真鼠标 → 1 个」；按地址开没有这一层。
+   */
+  private searchTool(): ToolDef {
+    return {
+      name: 'browser_search',
+      description:
+        'Search the web in this browser: opens the search engine\'s result page and returns the results as ' +
+        'addresses — title, URL and a short snippet each. Use it when the topic is vague and you do not know ' +
+        'which site to open; guessing domains or walking a site\'s own navigation is the other, worse way. ' +
+        'Default engine is Bing (China): Google and DuckDuckGo do not load from this machine. Sogou and Baidu ' +
+        'work but hand back their own redirect links. **Use the URLs**: open the one you want with browser_open ' +
+        '— clicking the result links on the page does not open a new page for them. The receipt names the ' +
+        'result page\'s `target`, so you can browser_read or browser_close it yourself.',
+      // 与 browser_open 同类：它会在她的浏览器里**开出一个页面**，所以是 act 不是纯 read。
+      tags: ['act', 'snapshot'],
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          query: { type: 'string', description: 'What to search for, words as a person would type them.' },
+          engine: { type: 'string', enum: ['bing', 'sogou', 'baidu'], description: 'Default comes from worlds.browser.searchEngine (bing).' },
+          count: { type: 'integer', description: `How many results to return; default ${SEARCH_COUNT_DEFAULT}, max ${SEARCH_COUNT_MAX}.` },
+        },
+        required: ['query'],
+      },
+      handler: async (args, ctx) => this.search(args, ctx),
     };
   }
 
@@ -639,6 +688,9 @@ export class BrowserWorld implements World {
         'Click the first element matching a CSS selector. Default is a JS click, which covers most cases. ' +
         '`native: true` sends a real mouse event at the element\'s centre: use it when the page ignores a JS click, ' +
         'when the click should count as a user gesture, or when it should open a file dialog. ' +
+        'A link that opens a new tab (`target=_blank`, which is what search result links are) opens **only** with ' +
+        '`native: true` — a JS click on it does nothing at all. When a click does open a new page, the receipt ' +
+        'names it, with its target id. ' +
         'Returns what was clicked and the page\'s title and URL right after.',
       tags: ['act'],
       parameters: {
@@ -900,6 +952,75 @@ export class BrowserWorld implements World {
     };
   }
 
+  /**
+   * 搜索的实现：开结果页（和 `open` 同一条路：先建页认下来，再导航），
+   * 然后注入抽取函数，把结果整理成一批地址。抽不到就把整页正文交回去——别让她空手。
+   */
+  private async search(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {
+    const query = str(args.query);
+    if (!query) return fail('query 是空的：给一个要搜的词。');
+    const asked = str(args.engine);
+    const engine: SearchEngineId = isSearchEngineId(asked)
+      ? asked
+      : isSearchEngineId(String(this.opts.cfg.searchEngine))
+        ? (this.opts.cfg.searchEngine as SearchEngineId)
+        : SEARCH_ENGINE_DEFAULT;
+    const count = clampCount(typeof args.count === 'number' ? args.count : undefined);
+    const notReady = await this.ensureReady();
+    if (notReady) return fail(notReady);
+
+    // 与 browser_open 同一套：先建空白页拿到 id（“认下来”），失败也不会留孤儿页面。
+    let targetId: string;
+    let openNote = '';
+    try {
+      const created = await this.newPage('about:blank', this.timeout(), ctx);
+      targetId = created.targetId;
+      openNote = created.note;
+    } catch (err) {
+      return fail(this.explain(err, '搜索'));
+    }
+    this.mine.set(targetId, Date.now());
+
+    try {
+      await this.relay.navigate(targetId, searchUrl(engine, query), this.navTimeout(), ctx.signal);
+    } catch (err) {
+      return fail(
+        `${this.explain(err, '打开搜索结果页', 'nav')}\n` +
+          `target: ${targetId} 这个页面还开着：你可以稍后 browser_read 一次，或 browser_close 关掉它。`,
+      );
+    }
+
+    let harvested: unknown = null;
+    try {
+      const result = await this.relay.evaluate(targetId, searchExpression(engine, count), this.timeout(), ctx.signal);
+      harvested = result.ok ? result.value : null;
+    } catch {
+      // 抽取这一发没回话不算失败：下面会退回整页正文。
+      harvested = null;
+    }
+    const harvest = normalizeHarvest(harvested, engine);
+
+    if (harvest && harvest.hits.length > 0) {
+      return {
+        text: [renderSearch(engine, query, harvest, { target: targetId }), openNote]
+          .filter((part) => part !== '')
+          .join('\n'),
+      };
+    }
+
+    // 抽取没命中（引擎换了结构、或者它给了验证页）：退回整页正文，并说明这是退路。
+    const empty = harvest ?? { anchors: 0, hits: [], title: '', url: searchUrl(engine, query) };
+    const page = await this.dump(targetId, null, OPEN_TEXT_MAX, ctx);
+    return {
+      text: [
+        renderSearch(engine, query, empty, { target: targetId, fallbackText: page.ok ? page.page.text : '' }),
+        openNote,
+      ]
+        .filter((part) => part !== '')
+        .join('\n'),
+    };
+  }
+
   private async read(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {
     const target = str(args.target);
     if (!target) return fail('target 是空的：给 browser_open 或 browser_tabs 回的那个 target。');
@@ -940,15 +1061,48 @@ export class BrowserWorld implements World {
     if (notReady) return fail(notReady);
 
     const native = args.native === true;
+    // 点之前先记一眼页面表。结果页上的链接是 `target=_blank`，点下去新页面开在**别处**，
+    // 而这个回执从前只说原页面「点击后此刻」——开出来那张她既看不见、也关不掉（不在她的页面表里）。
+    // 2026-10-12 量到：JS 点击开不出新页，真鼠标那一下会开出来。
+    const before = await this.relay.targets(this.timeout()).catch(() => null);
     try {
       const clicked = await this.relay.click(target, selector, native, this.timeout(), ctx.signal);
       const info = await this.relay.info(target, this.timeout(), ctx.signal).catch(() => null);
       const head = `已点击 ${native ? '（真实鼠标）' : ''}：${clicked.tag}${clicked.text ? ` 「${truncate(clicked.text, 80)}」` : ''}`;
       const tail = info ? `点击后此刻：${info.title || '(无标题)'} · ${info.url}（${info.ready}）` : null;
-      return { text: [head, tail].filter((line): line is string => line !== null).join('\n') };
+      const opened = await this.openedByClick(before);
+      return { text: [head, tail, ...opened].filter((line): line is string => line !== null).join('\n') };
     } catch (err) {
       return fail(this.explain(err, 'click'));
     }
+  }
+
+  /**
+   * 这次点击新开出来的页面，写进回执；有专属实例时**顺手登记成她的页**。
+   *
+   * 为什么登记要看 `ownBrowser`：借操作员日常那个浏览器时，两次快照之间也可能出现**他自己**开的
+   * 页面，认成她的就等于将来替她把它关掉。专属实例里没有别人，那条一定成立。
+   */
+  private async openedByClick(before: readonly PageTarget[] | null): Promise<string[]> {
+    if (!before) return [];
+    const after = await this.relay.targets(this.timeout()).catch(() => null);
+    if (!after) return [];
+    const known = new Set(before.map((page) => page.targetId));
+    const fresh = after.filter((page) => !known.has(page.targetId) && !INTERNAL_URL.test(page.url));
+    const lines: string[] = [];
+    for (const page of fresh) {
+      if (this.own) this.mine.set(page.targetId, Date.now());
+      const label = `${page.title || '(无标题)'} · ${page.url}\ntarget: ${page.targetId}`;
+      lines.push(`点击开出了一张新页面（${label}）`);
+    }
+    if (lines.length === 0) return lines;
+    lines.push(
+      this.own
+        ? '（那是你自己那个实例里的窗口，已经记成我开的：能 browser_read、能 browser_close，闲置也会被收掉。）'
+        : '（他那个浏览器里新开的页面没有登记成我开的：不动它——两次快照之间也可能有他自己开的东西。' +
+          '要读它就用 browser_open 按地址打开。）',
+    );
+    return lines;
   }
 
   private async type(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {

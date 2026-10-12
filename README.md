@@ -3,7 +3,7 @@
 Owner: `src/definition.ts`
 
 把本机 [web-access](https://github.com/eze-is/web-access) 的 CDP proxy 接成一个 World：
-bot 能在浏览器里开页、读页、点击、填表、上传、滚动、截图，能查本机的书签与历史，
+bot 能在浏览器里搜索、开页、读页、点击、填表、上传、滚动、截图，能查本机的书签与历史，
 接的是操作员日常那个浏览器时还能自己看一眼他在干什么（拉取式，见下面的「事件」）。
 
 两种接法：
@@ -19,8 +19,9 @@ bot 能在浏览器里开页、读页、点击、填表、上传、滚动、截�
 |---|---|
 | `src/definition.ts` | `WorldDefinition`：id、label、默认配置段、`preflight` |
 | `src/config.ts` | 配置段类型、默认值、控制台配置组 |
-| `src/world.ts` | `World` 实现：起停、十三个工具、`console()` |
+| `src/world.ts` | `World` 实现：起停、十四个工具、`console()` |
 | `src/cdp-client.ts` | cdp-proxy 的客户端：起停子进程、HTTP 调用、`find-url.mjs` |
+| `src/search.ts` | `browser_search` 的引擎表、抽取表达式与回执排版（纯函数，不带浏览器） |
 | `src/own-browser.ts` | 她自己的实例：起停、写发现文件、直接说 CDP（建窗口 / 激活 / 搬窗口） |
 | `src/window-raise.ts` | "搬到他眼前"的最后一步：抬 z 序（CDP 做不到，交给 Windows 的 `SetWindowPos`） |
 | `src/page-scripts.ts` | 注入页面执行的 JS：读页（穿 Shadow DOM 与 iframe）、填表 |
@@ -46,6 +47,7 @@ bot 能在浏览器里开页、读页、点击、填表、上传、滚动、截�
 | `ownBrowserHome` | 她的"家"目录。profile 落在 `<home>\Google\Chrome\User Data` |
 | `ownBrowserPort` | 这个实例的调试端口，默认 `9223`（别和 9222 上的日常浏览器撞） |
 | `bringToFront` | 默认 `true`：**允不允许她打断你**（把某个页面搬到你眼前）。这不是"页面能不能播"的开关——她的页面默认在屏幕外，媒体照样播 |
+| `searchEngine` | `browser_search` 的默认引擎，默认 `bing`（国内版）。也可填 `sogou` / `baidu`；别填 Google 或 DuckDuckGo，这台机器上打不开。这一项是热的：改完下一次搜索就生效 |
 
 为什么这样接：上游只从各浏览器**默认 profile** 的 `DevToolsActivePort` 找浏览器（现代 Chrome 用
 `--remote-debugging-port` 启动时并不写这个文件），所以本 World 拉起 proxy 时把"家"当 `LOCALAPPDATA`
@@ -54,6 +56,44 @@ bot 能在浏览器里开页、读页、点击、填表、上传、滚动、截�
 
 `find-url.mjs` 查历史要 `sqlite3` 命令在 PATH 上；没有时它自己的报错会原样回到回执里。
 （开了专属实例时，它查的是**她自己那个 profile** 的书签与历史。）
+
+## 搜索（2026-10-12 加的）
+
+她原话：「浏览器给我的是『打开这个地址、读正文』，没有『搜』这一步，主题一模糊我就只剩猜域名、翻站内导航两条路。」
+`browser_search` 填的就是这一步：一次调用把关键词变成一批**地址**（标题 + 地址 + 一句摘要），她拿地址去 `browser_open`。
+
+为什么不做成一个搜索 API：内置的 `websearch` World 只认 Brave 的密钥（部署里是关的），
+而在这台机器的真 Chrome 里量到的现实是 —— **Google 与 DuckDuckGo 打不开**（`ERR_TIMED_OUT`），
+能用的是 Bing 国内版、搜狗、百度。三个引擎的选择器是 2026-10-12 在真结果页上量出来的，不是照印象写的：
+
+| 引擎 | 结果锚点 | 抽到几条 | 地址是 | 摘要 |
+|---|---|---|---|---|
+| Bing 国内版（默认） | `#b_results > li.b_algo h2 a` | 10 | **真地址** | `.b_caption p`，来源站名在 `.tptt` |
+| 搜狗 | `h3 a` | 8 | `sogou.com/link?url=…` 跳转链接 | `.text-layout` / `.space-txt` |
+| 百度 | `#content_left div.result h3 a` | 6 | `baidu.com/link?url=…` 跳转链接 | 有时在 `[class*=abstract]` |
+
+跳转链接**直接打开**会落到真页（量过搜狗那条落到知乎文章），但地址上看不出站点；百度更差一点 ——
+实测有跳转链接打开后落回百度自己的页。所以默认引擎是 Bing 国内版：只有它把真地址摆在回执里。
+`worlds.browser.searchEngine` 改默认值，工具参数 `engine` 可以按次覆盖。
+
+抽取写成「一串锚点选择器，第一个找得到东西的就用」，并留了退路：一条都没抽到时把整页正文交回去，
+回执里说清是「引擎换了结构 / 给了验证页」，而不是让她以为搜索坏了。
+
+## 点链接与「新开的那张页面」
+
+结果页上的链接都是 `target=_blank`。2026-10-12 在她的实例里（独立窗口、屏幕外、`background: true`）量到：
+
+| 怎么点 | 结果 |
+|---|---|
+| `browser_click` 默认（JS `el.click()`） | **新页面 0 个**，也不报错 |
+| `browser_click` + `native: true`（CDP 真鼠标事件） | **新页面 1 个**，落的就是那条结果的真地址 |
+| 用那条地址 `browser_open` | 一样到位 —— 所以搜索这条路根本不点 |
+
+顺带补了一个洞：点击的旧回执只说原页面「点击后此刻」，新开出来的页面**一个字都不提**，
+而它也不在她的页面表里 —— `browser_close` 拒关、闲置回收也扫不到。现在点完会比对一次页面表，
+把新出现的写进回执；**专属实例里**（那个浏览器里没有别人）再顺手登记成她开的，于是能读、能关、闲置会被收。
+借操作员日常那个浏览器时**不登记**：两次快照之间也可能有他自己开的东西，认成她的就会将来替她关掉它。
+
 
 ## 起停
 

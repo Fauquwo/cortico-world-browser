@@ -25,6 +25,13 @@ import { join } from 'node:path';
 import { CdpRelay } from '../src/cdp-client.ts';
 import { OwnBrowser, createWindow, showTarget, windowBounds } from '../src/own-browser.ts';
 import { readExpression } from '../src/page-scripts.ts';
+import {
+  normalizeHarvest,
+  renderSearch,
+  searchExpression,
+  searchUrl,
+  type SearchEngineId,
+} from '../src/search.ts';
 
 function arg(name: string, fallback: string): string {
   const argv = process.argv.slice(2);
@@ -45,6 +52,8 @@ const extraUrl = arg('url', own ? '' : 'https://example.com');
 const exePath = arg('exe', 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe');
 const home = arg('home', join(tmpdir(), 'cortico-own-browser-smoke'));
 const cdpPort = Number(arg('cdp-port', '9223'));
+/** 搜索那一步用哪个引擎：默认 bing（国内版，唯一给真地址的那个）。 */
+const searchEngine = (arg('search-engine', 'bing') as SearchEngineId);
 
 const log = {
   child: () => log,
@@ -300,6 +309,45 @@ if (own) {
 }
 
 if (extraUrl !== '') await openAndRead(extraUrl);
+
+/**
+ * 搜索那一条（2026-10-12 加的）：对着**真的**引擎结果页跑一遍包里那段抽取函数，
+ * 把她会看到的回执原样打出来。不需要任何密钥，也不碰她自己的实例之外的东西。
+ *
+ * 判据：条目至少一条，且**每一条都得是真地址**（Bing 那一路；跳转链接的引擎不算，见下面那句提醒）。
+ */
+async function searchSmoke(engine: SearchEngineId): Promise<boolean> {
+  const query = '怎么挑机械键盘';
+  let target: string;
+  if (own) {
+    const created = await createWindow(cdpPort, 'about:blank', 5000);
+    target = created.targetId;
+  } else {
+    target = await relay.openBlank(30000);
+  }
+  console.log(`\n搜索（${engine}）：「${query}」`);
+  await relay.navigate(target, searchUrl(engine, query), 35000);
+  const harvest = await relay.evaluate(target, searchExpression(engine, 10), 30000);
+  const normalized = harvest.ok ? normalizeHarvest(harvest.value, engine) : null;
+  if (!normalized) {
+    console.error(`  抽取这一发没回成形的收获：${harvest.ok ? '形状不认' : harvest.error}`);
+    await relay.close(target, 30000).catch(() => {});
+    return false;
+  }
+  console.log(renderSearch(engine, query, normalized, { target }));
+  const ok = normalized.hits.length > 0;
+  // 收页面这件事别默默失败：留一张结果页在她的窗口里，是下一眼会困惑的东西。
+  const closed = await relay.close(target, 30000).then(() => true).catch(() => false);
+  console.log(`  搜索这条：${ok ? '过' : '没过'}（锚点 ${normalized.anchors} 个，条目 ${normalized.hits.length} 条）${closed ? '' : `，收页面没成：${target} 可能还开着`}`);
+  return ok;
+}
+
+if (!(await searchSmoke(searchEngine))) {
+  console.error('搜索结果页上一条都没抽出来：引擎多半换了页面结构，或者它给了验证页。');
+  await relay.stop();
+  ownBrowser?.stop();
+  process.exit(1);
+}
 
 // 谁是自己拉起的、谁是复用来的，要在 stop() 之前读：stop() 会把记录清掉。
 const relayWasOurs = relay.owned;

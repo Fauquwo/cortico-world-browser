@@ -2,6 +2,7 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import type { WorldDefinition } from 'cortico/world.ts';
 import { BROWSER_DEFAULTS, type BrowserConfigSection } from './config.ts';
+import { isSearchEngineId } from './search.ts';
 import { BrowserWorld } from './world.ts';
 
 const BROWSERS = ['chrome', 'edge', 'chromium'];
@@ -33,6 +34,12 @@ export const BROWSER: WorldDefinition<BrowserConfigSection> = {
     }
     if (!BROWSERS.includes(browser)) {
       throw new Error(`worlds.browser.browser 只能是 ${BROWSERS.join(' / ')}，现在是「${browser}」。`);
+    }
+    // 搜索那一路：只认量过能用的三个（Google 与 DuckDuckGo 在这台机器上打不开）。
+    if (!isSearchEngineId(String(ctx.cfg.searchEngine))) {
+      throw new Error(
+        `worlds.browser.searchEngine 只能是 bing / sogou / baidu，现在是「${String(ctx.cfg.searchEngine)}」。`,
+      );
     }
     // 专属实例那几项：开着就必须填全，漏什么在这里点名，别等运行起来才发现她没手。
     if (ctx.cfg.ownBrowser) {
