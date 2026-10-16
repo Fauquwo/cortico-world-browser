@@ -1,6 +1,7 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { describeTools, type WorldDefinition } from 'cortico/world.ts';
+import { VIDEO_TOOL_DECLS } from './video/tools.ts';
 import { BROWSER_DEFAULTS, type BrowserConfigSection } from './config.ts';
 import { isSearchEngineId } from './search.ts';
 import {
@@ -26,7 +27,7 @@ const BROWSERS = ['chrome', 'edge', 'chromium'];
 export const BROWSER: WorldDefinition<BrowserConfigSection> = {
   id: 'browser',
   label: 'Browser',
-  defaults: () => ({ ...BROWSER_DEFAULTS }),
+  defaults: () => structuredClone(BROWSER_DEFAULTS),
 
   /**
    * 激活前检查上游目录与浏览器名。漏配时在这里说清楚要填什么，
@@ -107,8 +108,10 @@ export const BROWSER: WorldDefinition<BrowserConfigSection> = {
         BROWSER_FOCUS_TOOL,
         BROWSER_CLOSE_TOOL,
         BROWSER_FIND_URL_TOOL,
+        ...VIDEO_TOOL_DECLS,
       ],
       {
+        ...Object.fromEntries(VIDEO_TOOL_DECLS.map(t => [t.name, t.description])),
         browser_open: {
           zh: '在他的浏览器里新开一个后台标签页打开地址，并读回标题、正文与链接。',
           en: 'Opens an address in a new background tab in his browser and reads back the title, text and links.',
@@ -168,6 +171,8 @@ export const BROWSER: WorldDefinition<BrowserConfigSection> = {
       },
     ),
     events: [
+      {type:'browser.video.state', description:{zh:'视频页或播放状态变化。',en:'Video page or playback state changed.'},trigger:'flush'},
+      {type:'browser.video.scene', description:{zh:'观看中的画面拼图、字幕和历史弹幕。',en:'Frame montage, subtitles and historical video danmaku while watching.'},trigger:'debounce'},
       { type: 'browser.ready', description: { zh: '浏览器与 cdp-proxy 都就绪了，工具可用。', en: 'The browser and cdp-proxy are ready; the tools are usable.' } },
       { type: 'browser.down', description: { zh: '浏览器起不来或连不上（proxy 拉不起来、浏览器没接上、端口被占等），工具会报失败。', en: 'The browser could not be started or reached (proxy failed to launch, browser not connected, port taken); the tools report failure.' } },
     ],

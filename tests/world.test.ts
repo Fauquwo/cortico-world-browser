@@ -1,9 +1,11 @@
+import { VIDEO_TOOL_DECLS } from '../src/video/tools.ts';
+import { BilibiliSession } from '../src/video/session.ts';
 import { createServer, type Server } from 'node:http';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ToolCallContext, ToolOutcome } from 'cortico/core/types.ts';
 import { dryMountWorld, fakeWorldContext } from 'cortico/extensions/dry-mount.ts';
 import { RelayError, classifyRelayError } from '../src/cdp-client.ts';
@@ -16,6 +18,16 @@ import { FakeHost } from './helpers/fake-host.ts';
 let scratchDir: string;
 let servers: Server[] = [];
 let worlds: BrowserWorld[] = [];
+
+/** Windows may allocate an ephemeral port that fetch refuses before opening a socket. */
+async function listenForHttp(server: Server): Promise<void> {
+  for (;;) {
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as AddressInfo).port;
+    if (port >= 1024 && ![2049,3659,4045,5060,5061,6000,6566,10080].includes(port) && !(port >= 6665 && port <= 6699)) return;
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+}
 
 beforeEach(() => {
   scratchDir = mkdtempSync(join(tmpdir(), 'browser-world-'));
@@ -186,7 +198,7 @@ async function fakeProxy(): Promise<FakeProxy> {
     })();
   });
   servers.push(server);
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  await listenForHttp(server);
   state.port = (server.address() as AddressInfo).port;
   return state;
 }
@@ -216,7 +228,7 @@ const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
 /** 空出来的端口：让「自己拉起」那条路有个确定的地方去听。 */
 async function freePort(): Promise<number> {
   const server = createServer();
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  await listenForHttp(server);
   const port = (server.address() as AddressInfo).port;
   await new Promise<void>((resolve) => server.close(() => resolve()));
   return port;
@@ -249,7 +261,7 @@ async function fakeBrowserCdp(): Promise<{ port: number; wsUrl: string }> {
     res.end('{}');
   });
   servers.push(server);
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  await listenForHttp(server);
   const port = (server.address() as AddressInfo).port;
   return { port, wsUrl: `ws://127.0.0.1:${port}/devtools/browser/FAKE-UUID` };
 }
@@ -296,7 +308,7 @@ describe('Browser World', () => {
     expect(report.failures).toEqual([]);
   });
 
-  it('工具表：十四个工具，都带 browser_ 前缀和非空标签', () => {
+  it('通用与视频工具都带 browser_ 前缀和非空标签', () => {
     const world = startedWorld(3456);
     const tools = world.tools();
     expect(tools.map((tool) => tool.name)).toEqual([
@@ -314,6 +326,7 @@ describe('Browser World', () => {
       'browser_focus',
       'browser_close',
       'browser_find_url',
+      ...VIDEO_TOOL_DECLS.map(tool => tool.name),
     ]);
     for (const tool of tools) {
       expect(tool.name.startsWith('browser_')).toBe(true);
@@ -1039,6 +1052,32 @@ describe('她自己的浏览器实例', () => {
     await sleep(20);
     await call(world, 'browser_tabs'); // 任何一次工具调用都会顺手扫一遍
     expect(proxy.closed).toContain(target);
+  });
+
+  it('观看租约保留视频页，同时回收其他闲置页；释放后视频页也可回收', async () => {
+    const proxy = await fakeProxy();
+    const cdp = await fakeBrowserCdp();
+    proxy.chromePort = cdp.port;
+    proxy.evalReply = () => PAGE_DUMP;
+    const world = startedWorld(proxy.port, { ...ownPatch(cdp.port), tabIdleMinutes: 0.00005 });
+    await world.start(new FakeHost());
+    let leaseTarget = '';
+    const lease = vi.spyOn(BilibiliSession.prototype, 'protects').mockImplementation(target => target === leaseTarget);
+    try {
+      const video = await call(world, 'browser_open', {url:'https://www.bilibili.com/video/BV1234567890'});
+      leaseTarget = /target (T\d+)/.exec(video.text)![1];
+      const other = await call(world, 'browser_open', {url:'https://example.com/other'});
+      const otherTarget = /target (T\d+)/.exec(other.text)![1];
+      await sleep(20);
+      await call(world, 'browser_tabs');
+      expect(proxy.closed).not.toContain(leaseTarget);
+      expect(proxy.closed).toContain(otherTarget);
+      const released = leaseTarget;
+      leaseTarget = '';
+      await call(world, 'browser_tabs');
+      await sleep(10);
+      expect(proxy.closed).toContain(released);
+    } finally { lease.mockRestore(); }
   });
 });
 

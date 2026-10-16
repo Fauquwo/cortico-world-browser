@@ -1,8 +1,8 @@
 {
   "name": "cortico-world-browser",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
-  "description": "Cortico World: drive the operator's own browser through a local CDP proxy — open, read, click, type, screenshot, and see which pages they visit",
+  "description": "Cortico Browser World: browse the web and watch Bilibili videos with frames, subtitles and danmaku in one browser. 浏览网页与观看 B 站视频，共用浏览器和登录态。",
   "license": "MIT",
   "keywords": [
     "cortico-world",
@@ -16,22 +16,35 @@
   "cortico": {
     "kind": "world",
     "api": 6,
-    "describe": "describe.json"
+    "describe": "describe.json",
+    "webUiClient": "dist/webui.js"
   },
   "files": [
     "src",
     "README.md",
-    "describe.json"
+    "describe.json",
+    "dist",
+    "THIRD_PARTY_NOTICES.md",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "smoke": "tsx scripts/smoke.ts"
+    "smoke": "tsx scripts/smoke.ts",
+    "smoke:video": "tsx scripts/smoke-video.ts",
+    "build:webui": "node scripts/build-webui.mjs",
+    "prepack": "node scripts/build-webui.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
-    "vitest": "^2.1.8"
+    "vitest": "^2.1.8",
+    "@types/qrcode": "^1.5.5",
+    "esbuild": "^0.24.0"
+  },
+  "dependencies": {
+    "puppeteer-core": "^25.12.0",
+    "qrcode": "^1.5.4"
   }
 }

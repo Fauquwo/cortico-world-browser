@@ -1,11 +1,11 @@
 {
-  // 只有 Node 侧代码,lib 里不放 DOM。本包没有自定义面板,所以不需要第二份配置。
+  // DOM 类型用于页内函数与独立打包的 WebUI 面板。
   "compilerOptions": {
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "Bundler",
     "allowImportingTsExtensions": true,
-    "lib": ["ES2022"],
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "types": ["node"],
     "strict": true,
     "noUncheckedIndexedAccess": false,

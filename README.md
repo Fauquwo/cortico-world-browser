@@ -19,7 +19,7 @@ bot 能在浏览器里搜索、开页、读页、点击、填表、上传、滚�
 |---|---|
 | `src/definition.ts` | `WorldDefinition`：id、label、默认配置段、`preflight` |
 | `src/config.ts` | 配置段类型、默认值、控制台配置组 |
-| `src/world.ts` | `World` 实现：起停、十四个工具、`console()` |
+| `src/world.ts` | `World` 实现：起停、通用与视频工具、`webUi()` |
 | `src/cdp-client.ts` | cdp-proxy 的客户端：起停子进程、HTTP 调用、`find-url.mjs` |
 | `src/search.ts` | `browser_search` 的引擎表、抽取表达式与回执排版（纯函数，不带浏览器） |
 | `src/own-browser.ts` | 她自己的实例：起停、写发现文件、直接说 CDP（建窗口 / 激活 / 搬窗口） |
@@ -192,12 +192,40 @@ bot 能在浏览器里搜索、开页、读页、点击、填表、上传、滚�
 导航那一段的超时单独放宽到至少 35 秒（`NAV_TIMEOUT_MIN_MS`）：上游的 CDP 超时就是 30 秒，客户端也卡
 30 秒的话永远只能拿到本地那句 `aborted due to timeout`，把上游的真话挡在外面。
 
+## B 站视频（0.2.0）
+
+B 站视频在同一个 Browser World 内，共用进程、profile 与页面登记，不需要安装独立视频 World。
+
+- `browser_video_open`：给 BV 号、B 站网址或上次列表序号打开视频；不填则回首页。
+- `browser_video_attach`：绑定已有 B 站 target；会重新加载并暂停该页，以捕获字幕和弹幕响应。不会取得用户页面的关闭权限。
+- `browser_video_play / pause / seek / exit`：播放并观察、暂停、跳转、退出观察。
+- `browser_video_look / quality`：看当前大图、查看或切换画质。
+- `browser_video_search / related / comments`：站内搜索、推荐和评论。
+
+回执带视频页的 target；截图、滚动、展示、关闭继续用 `browser_shot / scroll / focus / close`。关闭仍受原有页面归属规则约束。
+一时只绑定一个视频页，其他网页可继续操作。观看中免于闲置回收；暂停或退出后恢复回收，普通导航和关页会解除观看绑定。
+
+配置子段 `worlds.browser.video` 默认启用，观察最短间隔 15 秒、采样 2 fps、拼图最多 9 格；参数在 Browser 配置页调整。
+只有显式播放进入观看后才抽帧、投观察事件；未观看时不采集视频帧。旧延迟观察在暂停、跳转、切换视频或分 P、关页和停止时失效。
+没有字幕的视频只有画面；本模块不提供原始音轨或语音识别。
+
+WebUI 新增「B 站授权」与「播放状态」。已有 profile 登录可点「核验登录」，也可手机扫码；二维码结果只在内存暂存，应用到同一 profile 后清空。
+登出会清除该 Browser profile 的 B 站 cookie，暂停当前视频并回首页，其他网站的 cookie 保留。
+
+专属实例保留屏幕外工作与显式 `browser_focus` 展示。借操作员浏览器时，新的视频独立窗口可能出现在屏幕上；需要不打扰操作员时使用专属实例。
+
+构建：`pnpm build:webui`；`pnpm prepack` 也会生成随包分发的 `dist/webui.js`。
+开发验收：`pnpm smoke:video` 在独立临时 profile 的无界面 Chrome 中跑本地合成视频，不读取部署或日常浏览器登录态。
+
+上游来源与 MIT 许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
 ## 事件
 
-只有两条，都是服务状态：`browser.ready` / `browser.down`（内部事件，`flush`）。
+服务状态：`browser.ready` / `browser.down`（内部事件，`flush`）。
+视频状态：`browser.video.state`（`flush`）；观看观察：`browser.video.scene`（`debounce`，投递时拼图并附字幕与视频历史弹幕）。
 
-**他自己在浏览器里干什么，是拉取式的，不是推的。** World 不做任何定时采样，也不往事件队列里
-塞东西。bot 想知道的时候调一次 `browser_tabs`：回执给出此刻开着的页面，外加**自它上次调用以来**
+**他自己在浏览器里干什么，是拉取式的，不是推的。** 普通浏览活动不做定时采样或推送；视频观察仅在观看中开启。
+bot 想知道浏览活动时调一次 `browser_tabs`：回执给出此刻开着的页面，外加**自它上次调用以来**
 他新开、转到、关掉的页面（净变化）。中间开了又关的不留痕——那段时间没在看了，这是「她问才看」
 必然的代价，写进工具说明了。
 

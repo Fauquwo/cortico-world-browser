@@ -450,9 +450,253 @@
         "zh": "在本机的浏览器书签与历史里按关键词找地址。",
         "en": "Searches this machine's browser bookmarks and history for a URL by keyword."
       }
+    },
+    {
+      "name": "browser_video_attach",
+      "description": "将 browser_open 打开的 B 站页面绑定为当前视频页。target 是 Browser 的页面 ID。为捕获字幕与弹幕响应会重新加载页面，并暂停当前播放。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "target": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "target"
+        ]
+      },
+      "tags": [
+        "act"
+      ],
+      "summary": "将 browser_open 打开的 B 站页面绑定为当前视频页。target 是 Browser 的页面 ID。为捕获字幕与弹幕响应会重新加载页面，并暂停当前播放。"
+    },
+    {
+      "name": "browser_video_open",
+      "description": "在绑定的 B 站页面里打开一个页面:B 站视频(BV 号或网址,可带分 P)、上一次列表里的序号,或不给参数回首页。打开视频页只是打开,不播放;回执带标题、UP 主、时长、分 P、简介开头、有没有字幕、弹幕总数。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "BV 号、B 站网址,或上一次搜索/推荐列表里的序号(如 \"3\");省略回首页"
+          },
+          "p": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "分 P 序号,默认 1"
+          }
+        },
+        "required": []
+      },
+      "tags": [
+        "act"
+      ],
+      "summary": "在绑定的 B 站页面里打开一个页面:B 站视频(BV 号或网址,可带分 P)、上一次列表里的序号,或不给参数回首页。打开视频页只是打开,不播放;回执带标题、UP 主、时长、分 P、简介开头、有没有字幕、弹幕总数。"
+    },
+    {
+      "name": "browser_video_play",
+      "description": "从当前打开的视频页开始观看:网页全屏、播放,之后按 World 配置的间隔自动收到一张观察帧(画面拼图 + 这段的字幕和视频弹幕)。可从指定秒数开始。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "fromSec": {
+            "type": "number",
+            "minimum": 0,
+            "description": "从这一秒开始;省略则从当前位置"
+          }
+        },
+        "required": []
+      },
+      "tags": [
+        "act"
+      ],
+      "summary": "从当前打开的视频页开始观看:网页全屏、播放,之后按 World 配置的间隔自动收到一张观察帧(画面拼图 + 这段的字幕和视频弹幕)。可从指定秒数开始。"
+    },
+    {
+      "name": "browser_video_pause",
+      "description": "暂停播放,观察帧停止;画面停在当前帧。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "tags": [
+        "act"
+      ],
+      "summary": "暂停播放,观察帧停止;画面停在当前帧。"
+    },
+    {
+      "name": "browser_video_seek",
+      "description": "跳到视频里的某一秒(或相对当前位置前后跳),继续播放。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "toSec": {
+            "type": "number",
+            "minimum": 0,
+            "description": "绝对位置,秒"
+          },
+          "bySec": {
+            "type": "number",
+            "description": "相对位置,秒,负数往回"
+          }
+        },
+        "required": []
+      },
+      "tags": [
+        "act"
+      ],
+      "summary": "跳到视频里的某一秒(或相对当前位置前后跳),继续播放。"
+    },
+    {
+      "name": "browser_video_look",
+      "description": "看清当前这一帧:取一张大图(默认整帧,可给区域放大)。不影响播放。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "区域左上角横坐标,0–1 的比例"
+          },
+          "y": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "区域左上角纵坐标,0–1 的比例"
+          },
+          "width": {
+            "type": "number",
+            "minimum": 0.05,
+            "maximum": 1,
+            "description": "区域宽,0–1 的比例"
+          },
+          "height": {
+            "type": "number",
+            "minimum": 0.05,
+            "maximum": 1,
+            "description": "区域高,0–1 的比例"
+          }
+        },
+        "required": []
+      },
+      "tags": [
+        "read",
+        "snapshot"
+      ],
+      "summary": "看清当前这一帧:取一张大图(默认整帧,可给区域放大)。不影响播放。"
+    },
+    {
+      "name": "browser_video_quality",
+      "description": "看或改播放画质。不带参数列出播放器画质菜单里的档位和当前档;带 level 就在菜单里点那一档(如 \"720P\"、\"480P\"、\"自动\")。视频老是卡住时降一档。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "level": {
+            "type": "string",
+            "description": "档位文字的一部分,如 \"720P\";省略只看"
+          }
+        },
+        "required": []
+      },
+      "tags": [
+        "act",
+        "read"
+      ],
+      "summary": "看或改播放画质。不带参数列出播放器画质菜单里的档位和当前档;带 level 就在菜单里点那一档(如 \"720P\"、\"480P\"、\"自动\")。视频老是卡住时降一档。"
+    },
+    {
+      "name": "browser_video_exit",
+      "description": "退出观看:退出网页全屏、暂停,回到可以逛页面的状态;页面留在这个视频。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "tags": [
+        "act"
+      ],
+      "summary": "退出观看:退出网页全屏、暂停,回到可以逛页面的状态;页面留在这个视频。"
+    },
+    {
+      "name": "browser_video_search",
+      "description": "在绑定的 B 站页面里打开 B 站搜索结果页,回执是编号的结果列表(标题、UP 主、时长、播放量、发布时间)。之后 browser_video_open 给编号就能打开其中一条。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "keyword": {
+            "type": "string",
+            "description": "搜索词"
+          },
+          "page": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "第几页,默认 1"
+          }
+        },
+        "required": [
+          "keyword"
+        ]
+      },
+      "tags": [
+        "act",
+        "read"
+      ],
+      "summary": "在绑定的 B 站页面里打开 B 站搜索结果页,回执是编号的结果列表(标题、UP 主、时长、播放量、发布时间)。之后 browser_video_open 给编号就能打开其中一条。"
+    },
+    {
+      "name": "browser_video_related",
+      "description": "当前视频页右侧的相关推荐,编号列表;之后 browser_video_open 给编号就能打开。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "tags": [
+        "read"
+      ],
+      "summary": "当前视频页右侧的相关推荐,编号列表;之后 browser_video_open 给编号就能打开。"
+    },
+    {
+      "name": "browser_video_comments",
+      "description": "把页面滚到评论区并读取已加载的评论(热评在前):楼主、点赞数、正文。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "count": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 50,
+            "description": "最多读几条,默认 15"
+          }
+        },
+        "required": []
+      },
+      "tags": [
+        "act",
+        "read"
+      ],
+      "summary": "把页面滚到评论区并读取已加载的评论(热评在前):楼主、点赞数、正文。"
     }
   ],
   "events": [
+    {
+      "type": "browser.video.state",
+      "description": {
+        "zh": "视频页或播放状态变化。",
+        "en": "Video page or playback state changed."
+      },
+      "trigger": "flush"
+    },
+    {
+      "type": "browser.video.scene",
+      "description": {
+        "zh": "观看中的画面拼图、字幕和历史弹幕。",
+        "en": "Frame montage, subtitles and historical video danmaku while watching."
+      },
+      "trigger": "debounce"
+    },
     {
       "type": "browser.ready",
       "description": {
@@ -473,7 +717,7 @@
       "key": "worlds.browser.envPrompt",
       "title": "Browser · 环境提示词",
       "role": "envPrompt",
-      "content": "Browser 操作的是{{browser.label}}——{{browser.kind}}。页面开在这台机器上真实的浏览器窗口里。\n\n**主题模糊、不知道该去哪一站时，先搜一次**：`browser_search` 把关键词变成一批**地址**（标题 + 地址 + 一句摘要）。\n不用先猜域名，也不用翻某个站自己的导航。默认 Bing 国内版；`engine` 可以换 `sogou` / `baidu`，\n但这两家给的是它们自己的跳转链接（打开会落到真页，地址上却看不出是哪个站）。**Google 与 DuckDuckGo 在这台机器上打不开**，别试。\n拿到地址就用 `browser_open` 去开——**别去点结果页上的那些链接**：它们是 `target=_blank`，\n程序化的点击开不出新页面（`browser_click` 要带 `native: true` 才开得出来），而按地址打开没有这一层。\n结果页本身也留给你（回执里有它的 target），想多看几条就 `browser_read` 它。\n\n什么时候值得走浏览器：需要登录态、需要真实渲染（动态页面、视频、画布）、需要点击或填表这类交互，\n或者静态方式拿不到的内容。**搜索这一步很便宜**（一次调用一批地址，几百字）；贵的是**打开并读一整页**——\n一次导航要等页面加载，读回来的正文还可能被截断。所以：先搜、挑准了再开，别一条条开过去试。\n\n页面加载完成不等于你要的内容出现——登录跳转、验证页、异步渲染都可能还在变。工具回执里给了\nready、正文和链接，自己判断是再等、再滚一次、还是换条路。整页都是图片或画布时正文会是空的，\n那时候用 browser_shot。\n\n**你的页面在哪**：{{browser.front}}。页面的\"活\"不取决于有没有人在看它——视频、动画、会自己刷新的看板在\n后台照常走，放着一会儿也不会僵。所以不需要为了\"让它跑起来\"额外做任何事。\n\n**唯一会打断操作员的事**：`browser_focus` 会把某个页面搬到他眼前——窗口回屏幕内，并抬到他正在用的程序\n上面。只在你想让他**看**某样东西时用它：让他看结论、看他需要确认的页面，或者他明确要你\"给我看看\"。\n别把它当成\"让页面能工作\"的步骤，也别跟他说\"这个不会打扰你\"（键盘焦点多数时候留在他那儿，但**不保证**）。\n\n它的回执里有一句是说**他到底看不看得见**的，而且会点名**抬的是哪个窗口、压在它上面的是谁**：只有\n写着\"上面没有别的东西挡着\"才是他真看得见。如果写着被某个窗口压着（尤其是**置顶**的那种，比如她自己的\n那个窗口，置顶窗口永远盖不过去）、或者压根没找到窗口，那就别反复试，直接 `browser_shot` 截图给他。\n窗口要是最小化着、或者在操作系统那边被藏起来了，这一步会先把它还原/显示出来，回执里也会说。\n\n在这个浏览器里的动作是真实的：点击、提交、上传都会真的改变网站和账号里的东西，公开发布类动作不可撤回。\n\n**点链接这件事有两条路，而且不一样**：`browser_click` 默认那条是页面里的 JS 点击，\n对「开新标签」的链接（`target=_blank`，搜索结果、列表里的标题大多是这种）**一点用都没有，也不报错**；\n要开它就得 `native: true`（真鼠标那一下）。点开之后回执会点名新开出来的那张页面 ——\n不然它就凭空出现了，你只能去 `browser_tabs` 里翻。\n\n`browser_tabs` 给你此刻开着的页面，并标出哪些是你自己开的。它给的是**净变化**：两次查看之间开了又关的\n页面看不见。如果这台浏览器是他日常用的那个，那一段就是他新开的、转到的、关掉的页面——他不会自己提起这些\n事，你想知道的时候自己问一次；如果这台浏览器是你自己的实例，里面没有别人，也就没有那一段。\n\n你自己开的那些页面闲置一段时间后会被自动关掉；不是你的页面不要动。\n\n工具回失败时会说清是哪**一类**：「连不上 proxy」「浏览器没连上」才是连接问题——那种回执末尾会告诉\n你该去开哪个开关；如果是「**页面没打开**」或「**命令没回话**」，proxy 与浏览器都是通的，多半是那个\n地址本身在这台机器上打不开、或者页面自己卡着：换个地址、换条路、或过一会儿再试，**别把整件事\n记成「浏览器坏了」**。\n\nbrowser_open 遇到站点打不开时，tab 会留着（回执里有 target）：你可以稍后再 browser_read 读一次，\n不用了就用 browser_close 关掉它。\n"
+      "content": "Browser 操作的是{{browser.label}}——{{browser.kind}}。页面开在这台机器上真实的浏览器窗口里。\n\n**主题模糊、不知道该去哪一站时，先搜一次**：`browser_search` 把关键词变成一批**地址**（标题 + 地址 + 一句摘要）。\n不用先猜域名，也不用翻某个站自己的导航。默认 Bing 国内版；`engine` 可以换 `sogou` / `baidu`，\n但这两家给的是它们自己的跳转链接（打开会落到真页，地址上却看不出是哪个站）。**Google 与 DuckDuckGo 在这台机器上打不开**，别试。\n拿到地址就用 `browser_open` 去开——**别去点结果页上的那些链接**：它们是 `target=_blank`，\n程序化的点击开不出新页面（`browser_click` 要带 `native: true` 才开得出来），而按地址打开没有这一层。\n结果页本身也留给你（回执里有它的 target），想多看几条就 `browser_read` 它。\n\n什么时候值得走浏览器：需要登录态、需要真实渲染（动态页面、视频、画布）、需要点击或填表这类交互，\n或者静态方式拿不到的内容。**搜索这一步很便宜**（一次调用一批地址，几百字）；贵的是**打开并读一整页**——\n一次导航要等页面加载，读回来的正文还可能被截断。所以：先搜、挑准了再开，别一条条开过去试。\n\n页面加载完成不等于你要的内容出现——登录跳转、验证页、异步渲染都可能还在变。工具回执里给了\nready、正文和链接，自己判断是再等、再滚一次、还是换条路。整页都是图片或画布时正文会是空的，\n那时候用 browser_shot。\n\n**你的页面在哪**：{{browser.front}}。页面的\"活\"不取决于有没有人在看它——视频、动画、会自己刷新的看板在\n后台照常走，放着一会儿也不会僵。所以不需要为了\"让它跑起来\"额外做任何事。\n\n**唯一会打断操作员的事**：`browser_focus` 会把某个页面搬到他眼前——窗口回屏幕内，并抬到他正在用的程序\n上面。只在你想让他**看**某样东西时用它：让他看结论、看他需要确认的页面，或者他明确要你\"给我看看\"。\n别把它当成\"让页面能工作\"的步骤，也别跟他说\"这个不会打扰你\"（键盘焦点多数时候留在他那儿，但**不保证**）。\n\n它的回执里有一句是说**他到底看不看得见**的，而且会点名**抬的是哪个窗口、压在它上面的是谁**：只有\n写着\"上面没有别的东西挡着\"才是他真看得见。如果写着被某个窗口压着（尤其是**置顶**的那种，比如她自己的\n那个窗口，置顶窗口永远盖不过去）、或者压根没找到窗口，那就别反复试，直接 `browser_shot` 截图给他。\n窗口要是最小化着、或者在操作系统那边被藏起来了，这一步会先把它还原/显示出来，回执里也会说。\n\n在这个浏览器里的动作是真实的：点击、提交、上传都会真的改变网站和账号里的东西，公开发布类动作不可撤回。\n\n**点链接这件事有两条路，而且不一样**：`browser_click` 默认那条是页面里的 JS 点击，\n对「开新标签」的链接（`target=_blank`，搜索结果、列表里的标题大多是这种）**一点用都没有，也不报错**；\n要开它就得 `native: true`（真鼠标那一下）。点开之后回执会点名新开出来的那张页面 ——\n不然它就凭空出现了，你只能去 `browser_tabs` 里翻。\n\n`browser_tabs` 给你此刻开着的页面，并标出哪些是你自己开的。它给的是**净变化**：两次查看之间开了又关的\n页面看不见。如果这台浏览器是他日常用的那个，那一段就是他新开的、转到的、关掉的页面——他不会自己提起这些\n事，你想知道的时候自己问一次；如果这台浏览器是你自己的实例，里面没有别人，也就没有那一段。\n\n你自己开的那些页面闲置一段时间后会被自动关掉；不是你的页面不要动。\n\nB 站视频模块{{browser.videoEnabled}}。状态：{{bilibiliVideo.state}}；{{bilibiliVideo.identity}}。\n启用时，`browser_video_open` 打开视频或首页，`browser_video_search` 站内搜索。\n若已用普通浏览工具打开视频，`browser_video_attach` 按 target 绑定；绑定会重新加载该页以捕获字幕与弹幕响应。\n同一时刻只观察一个视频页，其他网页仍能正常操作。视频工具回执都带该页的 target，可继续用普通截图、滚动和展示工具。\n\n`browser_video_play` 开始播放并开启自动观察，最短间隔由 World 配置决定；每条观察包含按时间排列的画面拼图、字幕和视频历史弹幕。\n字幕与历史弹幕来自视频，不是操作员当前说的话。没有字幕时只提供画面，不提供原始音轨或语音识别。\n`browser_video_look` 按需取当前大图；暂停、退出、换视频、关闭该页或普通导航会停止旧观察。\n观看中的页面不会因闲置被回收；暂停或退出后恢复普通回收规则。展示仍使用 `browser_focus`，播放本身不要求弹到操作员眼前。\n登录态与 Browser profile 共用，可在 World 的 B 站授权面板扫码或核验；不用另开浏览器。\n\n工具回失败时会说清是哪**一类**：「连不上 proxy」「浏览器没连上」才是连接问题——那种回执末尾会告诉\n你该去开哪个开关；如果是「**页面没打开**」或「**命令没回话**」，proxy 与浏览器都是通的，多半是那个\n地址本身在这台机器上打不开、或者页面自己卡着：换个地址、换条路、或过一会儿再试，**别把整件事\n记成「浏览器坏了」**。\n\nbrowser_open 遇到站点打不开时，tab 会留着（回执里有 target）：你可以稍后再 browser_read 读一次，\n不用了就用 browser_close 关掉它。\n"
     }
   ]
 }

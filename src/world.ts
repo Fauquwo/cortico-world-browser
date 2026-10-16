@@ -23,6 +23,8 @@ import type {
 } from 'cortico/core/types.ts';
 import { nowIso } from 'cortico/core/util.ts';
 import { CdpRelay, RelayError, classifyRelayError, runFindUrl, type EvalResult, type PageTarget, type RelayFailureKind, type RelayHealth } from './cdp-client.ts';
+import { BilibiliSession, isBilibili } from './video/session.ts';
+import { VIDEO_DEFAULTS } from './video/config.ts';
 import { BROWSER_CONFIG_GROUP, type BrowserConfigSection } from './config.ts';
 import { OwnBrowser, createWindow, showTarget } from './own-browser.ts';
 import { raiseSentence, type RaiseResult } from './window-raise.ts';
@@ -401,6 +403,9 @@ export class BrowserWorld implements World {
   readonly id = 'browser';
 
   private readonly relay: CdpRelay;
+  private readonly video: BilibiliSession;
+  private readonly directPages = new Set<string>();
+  private readonly proxyTouchedAt = new Map<string, number>();
   /**
    * 配了专属实例时才有：她的浏览器由本 World 起停，并且我们还要直接对它说一句 CDP
    * （`Target.activateTarget`，上游没有这个端点）。没配时为 null，一切照旧。
@@ -425,6 +430,7 @@ export class BrowserWorld implements World {
 
   constructor(private readonly opts: BrowserWorldOptions) {
     const cfg = opts.cfg;
+    cfg.video ??= structuredClone(VIDEO_DEFAULTS);
     this.own = cfg.ownBrowser
       ? new OwnBrowser({
           exePath: cfg.ownBrowserExe.trim(),
@@ -440,12 +446,24 @@ export class BrowserWorld implements World {
       // 专属实例那一路：把"家"当 LOCALAPPDATA 交给 proxy，上游据此发现她那个实例。
       localAppDataRoot: this.own ? cfg.ownBrowserHome.trim() : undefined,
     });
+    this.video = new BilibiliSession({
+      cfg: cfg.video, timezone: opts.timezone,
+      acquire: requested => this.acquireVideoPage(requested),
+      touch: target => this.touch(target),
+      close: async target => {
+        if (!this.mine.has(target)) throw new Error('这个页面不是 Browser 开的，请手动关闭；已经停止观看。');
+        await this.relay.close(target, this.timeout());
+        this.mine.delete(target); this.directPages.delete(target); this.seen.delete(target);
+      },
+    });
   }
 
   /** 模板里的占位符：她操作的是哪个浏览器、是不是她自己的那个、页面在她自己的窗口里还是他的浏览器里。 */
   envPromptVars(): Record<string, string> {
     const own = this.own !== null;
     return {
+      ...this.video.envPromptVars(),
+      'browser.videoEnabled': this.opts.cfg.video.enabled ? '已启用' : '已禁用，browser_video_* 工具不可用',
       'browser.label': displayBrowser(this.opts.cfg.browser),
       'browser.kind': own
         ? '你自己那个专属实例（独立 profile 与调试端口，不带操作员的登录态）'
@@ -458,8 +476,11 @@ export class BrowserWorld implements World {
 
   webUi(): WorldWebUiDecl {
     const cfg = this.opts.cfg;
+    const video = this.video.webUi();
     return {
-      lamps: [this.lamp()],
+      panels: cfg.video.enabled ? video.panels : [],
+      invoke: video.invoke,
+      lamps: [this.lamp(), ...(cfg.video.enabled ? video.lamps ?? [] : [])],
       badges: [
         { label: '浏览器', value: this.browserLabel || displayBrowser(cfg.browser) || '未配置', tone: 'plain' },
         ...(this.own
@@ -468,7 +489,7 @@ export class BrowserWorld implements World {
         { label: 'proxy', value: `127.0.0.1:${cfg.port}`, tone: 'plain' },
         { label: '她开的页', value: this.mine.size, tone: 'plain' },
       ],
-      config: [BROWSER_CONFIG_GROUP],
+      config: [BROWSER_CONFIG_GROUP, ...(video.config ?? [])],
       promptDocs: [
         {
           key: 'worlds.browser.envPrompt',
@@ -478,6 +499,12 @@ export class BrowserWorld implements World {
           role: 'envPrompt',
           vars: [
             { name: 'browser.label', description: '当前配置要操作的浏览器。' },
+            { name: 'browser.front', description: '页面所在窗口与可见性。' },
+            { name: 'bilibiliVideo.identity', description: '共享 profile 的 B 站身份。' },
+            { name: 'bilibiliVideo.state', description: '绑定视频页与播放状态。' },
+            { name: 'bilibiliVideo.intervalSec', description: '最短观察间隔，秒。' },
+            { name: 'bilibiliVideo.stallSec', description: '卡顿判据，秒。' },
+            { name: 'browser.videoEnabled', description: 'B 站视频模块是否启用。' },
             { name: 'browser.kind', description: '那是她自己的实例，还是操作员日常那个。' },
           ],
         },
@@ -488,6 +515,7 @@ export class BrowserWorld implements World {
   async start(host: WorldHost): Promise<void> {
     this.host = host;
     this.running = true;
+    if (this.opts.cfg.video.enabled) await this.video.start(host);
     const log = host.log.child(this.id);
     try {
       // 配了专属实例：先保证它在跑，并把发现文件写出来——上游的 proxy 就是靠那个文件认出它的。
@@ -575,6 +603,7 @@ export class BrowserWorld implements World {
 
   async stop(): Promise<void> {
     this.running = false;
+    await this.video.stop();
     await this.relay.stop(); // 只关自己拉起的那个
     this.own?.stop(); // 同理：复用的那个实例不动它
     this.state = 'idle';
@@ -759,8 +788,34 @@ export class BrowserWorld implements World {
   }
 
   /** 任何带 `target` 的调用都记一笔"刚用过"，闲置回收靠这个时间戳。 */
+  private async acquireVideoPage(requested?: string): Promise<{targetId: string; browserURL: string}> {
+    const problem = await this.ensureReady();
+    if (problem) throw new Error(problem);
+    const health = await this.relay.probe();
+    const port = health?.chromePort;
+    if (!port || (this.own && port !== this.opts.cfg.ownBrowserPort)) throw new Error('proxy 未提供可核验的浏览器调试端口');
+    let targetId = requested;
+    if (targetId) {
+      const page = (await this.relay.targets(this.timeout())).find(p => p.targetId === targetId);
+      if (!page || !isBilibili(page.url)) throw new Error('指定 target 不存在或不是 B 站页面');
+    } else {
+      const created = await createWindow(port, 'about:blank', this.timeout());
+      targetId = created.targetId;
+      this.mine.set(targetId, Date.now());
+      this.directPages.add(targetId);
+    }
+    return {targetId, browserURL: 'http://127.0.0.1:' + port};
+  }
+
   private touch(targetId: string): void {
-    if (this.mine.has(targetId)) this.mine.set(targetId, Date.now());
+    if (!this.mine.has(targetId)) return;
+    const now = Date.now();
+    this.mine.set(targetId, now);
+    // Borrowed-browser pages created by the proxy have a second idle clock there.
+    if (!this.own && !this.directPages.has(targetId) && now - (this.proxyTouchedAt.get(targetId) ?? 0) >= 30_000) {
+      this.proxyTouchedAt.set(targetId, now);
+      void this.relay.info(targetId, 5000).catch(() => {});
+    }
   }
 
   /**
@@ -771,14 +826,15 @@ export class BrowserWorld implements World {
    * 走的是"每次工具调用顺便扫一眼"，不挂定时器（与这个 World「不定时看任何东西」一致）。
    */
   private sweepIdle(): void {
-    if (!this.own) return;
     const limit = Math.max(1, Math.round(this.opts.cfg.tabIdleMinutes * 60_000));
     const now = Date.now();
     for (const [target, usedAt] of [...this.mine]) {
-      if (now - usedAt < limit) continue;
+      if (!this.own && !this.directPages.has(target)) continue;
+      if (this.video.protects(target) || now - usedAt < limit) continue;
       this.mine.delete(target);
+      this.directPages.delete(target);
       this.seen.delete(target);
-      void this.relay.close(target, 5000).catch(() => {
+      void this.video.mutateTarget(target, () => this.relay.close(target, 5000)).catch(() => {
         // 关不成就算了：下次调用还会再试一遍
       });
     }
@@ -844,11 +900,16 @@ export class BrowserWorld implements World {
     ];
     // 一处挂钩：任何带 target 的调用都算"刚用过这个页面"。闲置回收（sweepIdle）靠这个时间戳，
     // 因为她的窗口是我们直连 CDP 建的、上游 proxy 不认识它们。
+    if (this.opts.cfg.video.enabled) defs.push(...this.video.tools());
     return defs.map((def) => ({
       ...def,
       handler: async (args, ctx) => {
         const target = str(args.target);
         if (target) this.touch(target);
+        if (target && (def.name === 'browser_navigate' || def.name === 'browser_close')) {
+          if (def.name === 'browser_close' && !this.mine.has(target)) return def.handler(args, ctx);
+          return this.video.mutateTarget(target, () => def.handler(args, ctx));
+        }
         return def.handler(args, ctx);
       },
     }));

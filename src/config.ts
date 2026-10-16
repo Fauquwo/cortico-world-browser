@@ -1,3 +1,4 @@
+import { VIDEO_DEFAULTS, type VideoConfig } from './video/config.ts';
 import type { ConfigGroup } from 'cortico/core/types.ts';
 import { SEARCH_ENGINE_DEFAULT, type SearchEngineId } from './search.ts';
 
@@ -8,6 +9,7 @@ import { SEARCH_ENGINE_DEFAULT, type SearchEngineId } from './search.ts';
  * 操作的是操作员自己那个浏览器。
  */
 export interface BrowserConfigSection {
+  video: VideoConfig;
   enabled: boolean;
   /**
    * 装了 web-access 的那个目录，里面有 `scripts/cdp-proxy.mjs` 与 `scripts/find-url.mjs`。
@@ -70,6 +72,7 @@ export interface BrowserConfigSection {
 }
 
 export const BROWSER_DEFAULTS: BrowserConfigSection = {
+  video: structuredClone(VIDEO_DEFAULTS),
   enabled: false,
   skillDir: '',
   browser: '',
