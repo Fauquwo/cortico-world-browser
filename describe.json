@@ -1,0 +1,479 @@
+{
+  "tools": [
+    {
+      "name": "browser_open",
+      "description": "Open a page in a new background tab in the operator's own browser and return what the page shows: title, URL, its readable text and its links. The tab carries the operator's login state. Use the returned `target` value for every later call on that page. A URL written without a scheme gets https:// in front of it.",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "Address to open, for example `example.com/report`."
+          }
+        },
+        "required": [
+          "url"
+        ]
+      },
+      "tags": [
+        "act",
+        "snapshot"
+      ],
+      "summary": {
+        "zh": "在他的浏览器里新开一个后台标签页打开地址，并读回标题、正文与链接。",
+        "en": "Opens an address in a new background tab in his browser and reads back the title, text and links."
+      }
+    },
+    {
+      "name": "browser_search",
+      "description": "Search the web in this browser: opens the search engine's result page and returns the results as addresses — title, URL and a short snippet each. Use it when the topic is vague and you do not know which site to open; guessing domains or walking a site's own navigation is the other, worse way. Default engine is Bing (China): Google and DuckDuckGo do not load from this machine. Sogou and Baidu work but hand back their own redirect links. **Use the URLs**: open the one you want with browser_open — clicking the result links on the page does not open a new page for them. The receipt names the result page's `target`, so you can browser_read or browser_close it yourself.",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "What to search for, words as a person would type them."
+          },
+          "engine": {
+            "type": "string",
+            "enum": [
+              "bing",
+              "sogou",
+              "baidu"
+            ],
+            "description": "Default comes from worlds.browser.searchEngine (bing)."
+          },
+          "count": {
+            "type": "integer",
+            "description": "How many results to return; default 10, max 20."
+          }
+        },
+        "required": [
+          "query"
+        ]
+      },
+      "tags": [
+        "act",
+        "snapshot"
+      ],
+      "summary": {
+        "zh": "搜一次，把结果当一批地址交回来（默认 Bing）。",
+        "en": "Runs one search and hands the results back as a batch of addresses (Bing by default)."
+      }
+    },
+    {
+      "name": "browser_read",
+      "description": "Read the readable text and links of a page you already opened, by `target`. Pass `selector` to read one part of the page instead of the whole document. Text reaching the limit is cut and flagged. `ready` is the document readyState, not proof the content you want has appeared.",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "Target id returned by browser_open or browser_tabs."
+          },
+          "selector": {
+            "type": "string",
+            "description": "CSS selector to read inside, for example `main article`."
+          },
+          "maxChars": {
+            "type": "integer",
+            "description": "How much text to return; default 8000, max 40000."
+          }
+        },
+        "required": [
+          "target"
+        ]
+      },
+      "tags": [
+        "read",
+        "snapshot"
+      ],
+      "summary": {
+        "zh": "按 target 读一个已打开页面的正文与链接，给选择器就读那一块。",
+        "en": "Reads the text and links of an already-opened page by target, or just one part when given a selector."
+      }
+    },
+    {
+      "name": "browser_js",
+      "description": "Evaluate one JavaScript expression inside the page and return its value. This is the escape hatch when the other tools do not cover what the page needs. Expressions only: to run several statements, wrap them yourself as `(async () => { ... })()` and return a value. A thrown error comes back as a failed receipt. The value must be JSON-serializable; DOM nodes and functions come back as their names.",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "Target id returned by browser_open or browser_tabs."
+          },
+          "expression": {
+            "type": "string",
+            "description": "JavaScript expression, for example `document.querySelectorAll(\"a\").length`."
+          }
+        },
+        "required": [
+          "target",
+          "expression"
+        ]
+      },
+      "tags": [
+        "act"
+      ],
+      "summary": {
+        "zh": "在页面里求值一段 JS 表达式，别的工具不够用时用它。",
+        "en": "Evaluates one JavaScript expression in the page, for what the other tools do not cover."
+      }
+    },
+    {
+      "name": "browser_click",
+      "description": "Click the first element matching a CSS selector. Default is a JS click, which covers most cases. `native: true` sends a real mouse event at the element's centre: use it when the page ignores a JS click, when the click should count as a user gesture, or when it should open a file dialog. A link that opens a new tab (`target=_blank`, which is what search result links are) opens **only** with `native: true` — a JS click on it does nothing at all. When a click does open a new page, the receipt names it, with its target id. Returns what was clicked and the page's title and URL right after.",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "Target id returned by browser_open or browser_tabs."
+          },
+          "selector": {
+            "type": "string",
+            "description": "CSS selector of the element to click."
+          },
+          "native": {
+            "type": "boolean",
+            "description": "Send a real mouse event instead of `el.click()`."
+          }
+        },
+        "required": [
+          "target",
+          "selector"
+        ]
+      },
+      "tags": [
+        "act"
+      ],
+      "summary": {
+        "zh": "点第一个匹配选择器的元素；native 发真鼠标事件（开新标签的链接只有它能点开）。",
+        "en": "Clicks the first element matching a selector; native sends a real mouse event (the only way a target=_blank link opens)."
+      }
+    },
+    {
+      "name": "browser_type",
+      "description": "Type a value into an input, textarea, select or contenteditable element, then fire input and change events so frameworks notice. `submit: true` sends the value and submits: the containing form when there is one, otherwise an Enter key press on the element.",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "Target id returned by browser_open or browser_tabs."
+          },
+          "selector": {
+            "type": "string",
+            "description": "CSS selector of the field."
+          },
+          "value": {
+            "type": "string",
+            "description": "Text to put in, or the option of a select."
+          },
+          "submit": {
+            "type": "boolean",
+            "description": "Submit after typing."
+          }
+        },
+        "required": [
+          "target",
+          "selector",
+          "value"
+        ]
+      },
+      "tags": [
+        "act"
+      ],
+      "summary": {
+        "zh": "往输入框、下拉或可编辑元素里填值，并触发 input/change；可以顺手提交。",
+        "en": "Types a value into an input, select or editable element, firing input/change, and can submit it."
+      }
+    },
+    {
+      "name": "browser_upload",
+      "description": "Attach local files to a page's file input, bypassing the file dialog. `files` are absolute paths on this machine — a file in your own workspace is one.",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "Target id returned by browser_open or browser_tabs."
+          },
+          "selector": {
+            "type": "string",
+            "description": "CSS selector of the `input[type=file]`."
+          },
+          "files": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Absolute paths to attach."
+          }
+        },
+        "required": [
+          "target",
+          "selector",
+          "files"
+        ]
+      },
+      "tags": [
+        "act"
+      ],
+      "summary": {
+        "zh": "把本机文件挂到页面的 file input 上，绕过文件对话框。",
+        "en": "Attaches local files to a page file input, bypassing the file dialog."
+      }
+    },
+    {
+      "name": "browser_scroll",
+      "description": "Scroll the page. `to: bottom` is the usual one: it loads lazy content, so images and later sections exist in the DOM afterwards. `y` is the distance for `down` and `up`.",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "Target id returned by browser_open or browser_tabs."
+          },
+          "to": {
+            "type": "string",
+            "enum": [
+              "down",
+              "up",
+              "top",
+              "bottom"
+            ],
+            "description": "Where to scroll; default `down`."
+          },
+          "y": {
+            "type": "integer",
+            "description": "Pixels for `down` / `up`; default 3000."
+          }
+        },
+        "required": [
+          "target"
+        ]
+      },
+      "tags": [
+        "act"
+      ],
+      "summary": {
+        "zh": "滚动页面（bottom 会加载懒加载内容）。",
+        "en": "Scrolls the page (bottom loads lazy content)."
+      }
+    },
+    {
+      "name": "browser_shot",
+      "description": "Capture one screenshot of the page and attach it to the receipt. The image is the viewport, not the whole document. Use it when the content is in images, canvas or video, where the readable text comes back empty or thin — and scroll first if the part you need is further down.",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "Target id returned by browser_open or browser_tabs."
+          }
+        },
+        "required": [
+          "target"
+        ]
+      },
+      "tags": [
+        "read"
+      ],
+      "summary": {
+        "zh": "截一张视口截图，作为图片附在回执里。",
+        "en": "Captures one screenshot of the viewport and attaches it to the receipt."
+      }
+    },
+    {
+      "name": "browser_navigate",
+      "description": "Move an existing tab to another address, or go back one entry. Use `browser_open` instead when you want a second page at the same time. A URL without a scheme gets https:// in front of it.",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "Target id returned by browser_open or browser_tabs."
+          },
+          "url": {
+            "type": "string",
+            "description": "Address to move to."
+          },
+          "back": {
+            "type": "boolean",
+            "description": "Go back one entry in this tab's history instead."
+          }
+        },
+        "required": [
+          "target"
+        ]
+      },
+      "tags": [
+        "act",
+        "snapshot"
+      ],
+      "summary": {
+        "zh": "把已有的标签页转到另一个地址，或后退一步。",
+        "en": "Moves an existing tab to another address, or goes back one entry."
+      }
+    },
+    {
+      "name": "browser_tabs",
+      "description": "List the pages open in the browser right now, each with its target id. Entries are marked `mine: true` when you opened them — those are the only ones `browser_close` accepts. When the browser is the operator's own, this also reports what changed since the previous call: the pages he opened, moved or closed in between, as a net difference (a page he opened and closed in between leaves no trace, and the browser's own pages never appear). When it is your own instance, there is nobody else browsing in it, so no change section is reported.",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {}
+      },
+      "tags": [
+        "read",
+        "snapshot"
+      ],
+      "summary": {
+        "zh": "列出此刻打开的页面，并报上一次看以来他开、转、关了哪些页。",
+        "en": "Lists the pages open right now and reports which ones he opened, moved or closed since the last look."
+      }
+    },
+    {
+      "name": "browser_focus",
+      "description": "Bring one of your pages into the operator's view: its window is restored if it is minimized or hidden, moved back on screen, and raised above whatever he is using. Use it when you actually want him to look at something. This is the only tool that takes over his screen, so reach for it deliberately — your pages work fine, media included, while they stay off screen, and this interrupts whatever he is doing (his keyboard focus usually stays where it was, but that is not guaranteed). The receipt tells you the page's document.visibilityState afterwards, which window it raised, and what (if anything) is sitting on top of it — only if that last part says nothing is in the way can he really see it. When something is in the way (a topmost window cannot be covered at all) or no window could be identified, do not retry in a loop: browser_shot is the reliable way to show him instead.",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "Target id returned by browser_open or browser_tabs."
+          }
+        },
+        "required": [
+          "target"
+        ]
+      },
+      "tags": [
+        "act"
+      ],
+      "summary": {
+        "zh": "把她自己的窗口搬到操作员眼前（独占屏幕，只在真想让他看时用）。",
+        "en": "Brings her own window into the operator's view (takes over the screen; only when she really wants him to look)."
+      }
+    },
+    {
+      "name": "browser_close",
+      "description": "Close a page you opened. Pages the operator opened are refused on purpose: closing one loses his state. Your pages are also closed automatically when they sit idle, so this is for tidying up sooner than that.",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "Target id of a page you opened."
+          }
+        },
+        "required": [
+          "target"
+        ]
+      },
+      "tags": [
+        "act"
+      ],
+      "summary": {
+        "zh": "关掉一个她开的页面；他自己开的页面一律拒绝关。",
+        "en": "Closes a page she opened; pages the operator opened are refused."
+      }
+    },
+    {
+      "name": "browser_find_url",
+      "description": "Search this machine's browser bookmarks and history for a URL. Use it when the target is something the operator has visited — a page he mentions by name, an internal system no search engine can reach. Keywords are AND-ed and match title and URL. Returns the tool's own listing text.",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "keywords": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Words to match, all of them."
+          },
+          "only": {
+            "type": "string",
+            "enum": [
+              "bookmarks",
+              "history"
+            ],
+            "description": "Search one source only."
+          },
+          "browser": {
+            "type": "string",
+            "enum": [
+              "chrome",
+              "edge"
+            ],
+            "description": "Limit to one browser's data."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "How many results; default 20 in the tool itself."
+          },
+          "since": {
+            "type": "string",
+            "description": "History only: `1d`, `7h`, `30m` or `YYYY-MM-DD`."
+          },
+          "sort": {
+            "type": "string",
+            "enum": [
+              "recent",
+              "visits"
+            ],
+            "description": "History only: by last visit or by visit count."
+          }
+        },
+        "required": []
+      },
+      "tags": [
+        "read",
+        "snapshot"
+      ],
+      "summary": {
+        "zh": "在本机的浏览器书签与历史里按关键词找地址。",
+        "en": "Searches this machine's browser bookmarks and history for a URL by keyword."
+      }
+    }
+  ],
+  "events": [
+    {
+      "type": "browser.ready",
+      "description": {
+        "zh": "浏览器与 cdp-proxy 都就绪了，工具可用。",
+        "en": "The browser and cdp-proxy are ready; the tools are usable."
+      }
+    },
+    {
+      "type": "browser.down",
+      "description": {
+        "zh": "浏览器起不来或连不上（proxy 拉不起来、浏览器没接上、端口被占等），工具会报失败。",
+        "en": "The browser could not be started or reached (proxy failed to launch, browser not connected, port taken); the tools report failure."
+      }
+    }
+  ],
+  "prompts": [
+    {
+      "key": "worlds.browser.envPrompt",
+      "title": "Browser · 环境提示词",
+      "role": "envPrompt",
+      "content": "Browser 操作的是{{browser.label}}——{{browser.kind}}。页面开在这台机器上真实的浏览器窗口里。\n\n**主题模糊、不知道该去哪一站时，先搜一次**：`browser_search` 把关键词变成一批**地址**（标题 + 地址 + 一句摘要）。\n不用先猜域名，也不用翻某个站自己的导航。默认 Bing 国内版；`engine` 可以换 `sogou` / `baidu`，\n但这两家给的是它们自己的跳转链接（打开会落到真页，地址上却看不出是哪个站）。**Google 与 DuckDuckGo 在这台机器上打不开**，别试。\n拿到地址就用 `browser_open` 去开——**别去点结果页上的那些链接**：它们是 `target=_blank`，\n程序化的点击开不出新页面（`browser_click` 要带 `native: true` 才开得出来），而按地址打开没有这一层。\n结果页本身也留给你（回执里有它的 target），想多看几条就 `browser_read` 它。\n\n什么时候值得走浏览器：需要登录态、需要真实渲染（动态页面、视频、画布）、需要点击或填表这类交互，\n或者静态方式拿不到的内容。**搜索这一步很便宜**（一次调用一批地址，几百字）；贵的是**打开并读一整页**——\n一次导航要等页面加载，读回来的正文还可能被截断。所以：先搜、挑准了再开，别一条条开过去试。\n\n页面加载完成不等于你要的内容出现——登录跳转、验证页、异步渲染都可能还在变。工具回执里给了\nready、正文和链接，自己判断是再等、再滚一次、还是换条路。整页都是图片或画布时正文会是空的，\n那时候用 browser_shot。\n\n**你的页面在哪**：{{browser.front}}。页面的\"活\"不取决于有没有人在看它——视频、动画、会自己刷新的看板在\n后台照常走，放着一会儿也不会僵。所以不需要为了\"让它跑起来\"额外做任何事。\n\n**唯一会打断操作员的事**：`browser_focus` 会把某个页面搬到他眼前——窗口回屏幕内，并抬到他正在用的程序\n上面。只在你想让他**看**某样东西时用它：让他看结论、看他需要确认的页面，或者他明确要你\"给我看看\"。\n别把它当成\"让页面能工作\"的步骤，也别跟他说\"这个不会打扰你\"（键盘焦点多数时候留在他那儿，但**不保证**）。\n\n它的回执里有一句是说**他到底看不看得见**的，而且会点名**抬的是哪个窗口、压在它上面的是谁**：只有\n写着\"上面没有别的东西挡着\"才是他真看得见。如果写着被某个窗口压着（尤其是**置顶**的那种，比如她自己的\n那个窗口，置顶窗口永远盖不过去）、或者压根没找到窗口，那就别反复试，直接 `browser_shot` 截图给他。\n窗口要是最小化着、或者在操作系统那边被藏起来了，这一步会先把它还原/显示出来，回执里也会说。\n\n在这个浏览器里的动作是真实的：点击、提交、上传都会真的改变网站和账号里的东西，公开发布类动作不可撤回。\n\n**点链接这件事有两条路，而且不一样**：`browser_click` 默认那条是页面里的 JS 点击，\n对「开新标签」的链接（`target=_blank`，搜索结果、列表里的标题大多是这种）**一点用都没有，也不报错**；\n要开它就得 `native: true`（真鼠标那一下）。点开之后回执会点名新开出来的那张页面 ——\n不然它就凭空出现了，你只能去 `browser_tabs` 里翻。\n\n`browser_tabs` 给你此刻开着的页面，并标出哪些是你自己开的。它给的是**净变化**：两次查看之间开了又关的\n页面看不见。如果这台浏览器是他日常用的那个，那一段就是他新开的、转到的、关掉的页面——他不会自己提起这些\n事，你想知道的时候自己问一次；如果这台浏览器是你自己的实例，里面没有别人，也就没有那一段。\n\n你自己开的那些页面闲置一段时间后会被自动关掉；不是你的页面不要动。\n\n工具回失败时会说清是哪**一类**：「连不上 proxy」「浏览器没连上」才是连接问题——那种回执末尾会告诉\n你该去开哪个开关；如果是「**页面没打开**」或「**命令没回话**」，proxy 与浏览器都是通的，多半是那个\n地址本身在这台机器上打不开、或者页面自己卡着：换个地址、换条路、或过一会儿再试，**别把整件事\n记成「浏览器坏了」**。\n\nbrowser_open 遇到站点打不开时，tab 会留着（回执里有 target）：你可以稍后再 browser_read 读一次，\n不用了就用 browser_close 关掉它。\n"
+    }
+  ]
+}

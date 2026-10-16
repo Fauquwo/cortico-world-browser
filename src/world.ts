@@ -15,8 +15,9 @@ import type {
   ToolCallContext,
   ToolDef,
   ToolOutcome,
+  ToolSpec,
   World,
-  WorldConsoleDecl,
+  WorldWebUiDecl,
   WorldHost,
   WorldLamp,
 } from 'cortico/core/types.ts';
@@ -122,6 +123,280 @@ export interface BrowserWorldOptions {
   timezone: string;
 }
 
+/**
+ * 全部工具的静态声明：`tools()` 与定义里的 describe 都取它。
+ * 实例只补 handler，不改这里的字。工具是否**能用**按配置变（专属实例、bringToFront），
+ * 名字与声明不随配置变。
+ */
+export const BROWSER_OPEN_TOOL: ToolSpec = {
+  name: 'browser_open',
+  description:
+    'Open a page in a new background tab in the operator\'s own browser and return what the page shows: ' +
+    'title, URL, its readable text and its links. The tab carries the operator\'s login state. ' +
+    'Use the returned `target` value for every later call on that page. ' +
+    'A URL written without a scheme gets https:// in front of it.',
+  tags: ['act', 'snapshot'],
+  parameters: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      url: { type: 'string', description: 'Address to open, for example `example.com/report`.' },
+    },
+    required: ['url'],
+  },
+};
+
+export const BROWSER_SEARCH_TOOL: ToolSpec = {
+  name: 'browser_search',
+  description:
+    'Search the web in this browser: opens the search engine\'s result page and returns the results as ' +
+    'addresses — title, URL and a short snippet each. Use it when the topic is vague and you do not know ' +
+    'which site to open; guessing domains or walking a site\'s own navigation is the other, worse way. ' +
+    'Default engine is Bing (China): Google and DuckDuckGo do not load from this machine. Sogou and Baidu ' +
+    'work but hand back their own redirect links. **Use the URLs**: open the one you want with browser_open ' +
+    '— clicking the result links on the page does not open a new page for them. The receipt names the ' +
+    'result page\'s `target`, so you can browser_read or browser_close it yourself.',
+  // 与 browser_open 同类：它会在她的浏览器里**开出一个页面**，所以是 act 不是纯 read。
+  tags: ['act', 'snapshot'],
+  parameters: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      query: { type: 'string', description: 'What to search for, words as a person would type them.' },
+      engine: { type: 'string', enum: ['bing', 'sogou', 'baidu'], description: 'Default comes from worlds.browser.searchEngine (bing).' },
+      count: { type: 'integer', description: `How many results to return; default ${SEARCH_COUNT_DEFAULT}, max ${SEARCH_COUNT_MAX}.` },
+    },
+    required: ['query'],
+  },
+};
+
+export const BROWSER_READ_TOOL: ToolSpec = {
+  name: 'browser_read',
+  description:
+    'Read the readable text and links of a page you already opened, by `target`. ' +
+    'Pass `selector` to read one part of the page instead of the whole document. ' +
+    'Text reaching the limit is cut and flagged. `ready` is the document readyState, not proof the ' +
+    'content you want has appeared.',
+  tags: ['read', 'snapshot'],
+  parameters: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      target: { type: 'string', description: 'Target id returned by browser_open or browser_tabs.' },
+      selector: { type: 'string', description: 'CSS selector to read inside, for example `main article`.' },
+      maxChars: { type: 'integer', description: `How much text to return; default ${READ_TEXT_DEFAULT}, max ${READ_TEXT_MAX}.` },
+    },
+    required: ['target'],
+  },
+};
+
+export const BROWSER_JS_TOOL: ToolSpec = {
+  name: 'browser_js',
+  description:
+    'Evaluate one JavaScript expression inside the page and return its value. This is the escape hatch when ' +
+    'the other tools do not cover what the page needs. Expressions only: to run several statements, wrap them ' +
+    'yourself as `(async () => { ... })()` and return a value. A thrown error comes back as a failed receipt. ' +
+    'The value must be JSON-serializable; DOM nodes and functions come back as their names.',
+  tags: ['act'],
+  parameters: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      target: { type: 'string', description: 'Target id returned by browser_open or browser_tabs.' },
+      expression: { type: 'string', description: 'JavaScript expression, for example `document.querySelectorAll("a").length`.' },
+    },
+    required: ['target', 'expression'],
+  },
+};
+
+export const BROWSER_CLICK_TOOL: ToolSpec = {
+  name: 'browser_click',
+  description:
+    'Click the first element matching a CSS selector. Default is a JS click, which covers most cases. ' +
+    '`native: true` sends a real mouse event at the element\'s centre: use it when the page ignores a JS click, ' +
+    'when the click should count as a user gesture, or when it should open a file dialog. ' +
+    'A link that opens a new tab (`target=_blank`, which is what search result links are) opens **only** with ' +
+    '`native: true` — a JS click on it does nothing at all. When a click does open a new page, the receipt ' +
+    'names it, with its target id. ' +
+    'Returns what was clicked and the page\'s title and URL right after.',
+  tags: ['act'],
+  parameters: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      target: { type: 'string', description: 'Target id returned by browser_open or browser_tabs.' },
+      selector: { type: 'string', description: 'CSS selector of the element to click.' },
+      native: { type: 'boolean', description: 'Send a real mouse event instead of `el.click()`.' },
+    },
+    required: ['target', 'selector'],
+  },
+};
+
+export const BROWSER_TYPE_TOOL: ToolSpec = {
+  name: 'browser_type',
+  description:
+    'Type a value into an input, textarea, select or contenteditable element, then fire input and change events ' +
+    'so frameworks notice. `submit: true` sends the value and submits: the containing form when there is one, ' +
+    'otherwise an Enter key press on the element.',
+  tags: ['act'],
+  parameters: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      target: { type: 'string', description: 'Target id returned by browser_open or browser_tabs.' },
+      selector: { type: 'string', description: 'CSS selector of the field.' },
+      value: { type: 'string', description: 'Text to put in, or the option of a select.' },
+      submit: { type: 'boolean', description: 'Submit after typing.' },
+    },
+    required: ['target', 'selector', 'value'],
+  },
+};
+
+export const BROWSER_UPLOAD_TOOL: ToolSpec = {
+  name: 'browser_upload',
+  description:
+    'Attach local files to a page\'s file input, bypassing the file dialog. ' +
+    '`files` are absolute paths on this machine — a file in your own workspace is one.',
+  tags: ['act'],
+  parameters: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      target: { type: 'string', description: 'Target id returned by browser_open or browser_tabs.' },
+      selector: { type: 'string', description: 'CSS selector of the `input[type=file]`.' },
+      files: { type: 'array', items: { type: 'string' }, description: 'Absolute paths to attach.' },
+    },
+    required: ['target', 'selector', 'files'],
+  },
+};
+
+export const BROWSER_SCROLL_TOOL: ToolSpec = {
+  name: 'browser_scroll',
+  description:
+    'Scroll the page. `to: bottom` is the usual one: it loads lazy content, so images and later sections ' +
+    'exist in the DOM afterwards. `y` is the distance for `down` and `up`.',
+  tags: ['act'],
+  parameters: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      target: { type: 'string', description: 'Target id returned by browser_open or browser_tabs.' },
+      to: { type: 'string', enum: ['down', 'up', 'top', 'bottom'], description: 'Where to scroll; default `down`.' },
+      y: { type: 'integer', description: 'Pixels for `down` / `up`; default 3000.' },
+    },
+    required: ['target'],
+  },
+};
+
+export const BROWSER_SHOT_TOOL: ToolSpec = {
+  name: 'browser_shot',
+  description:
+    'Capture one screenshot of the page and attach it to the receipt. The image is the viewport, not the whole ' +
+    'document. Use it when the content is in images, canvas or video, where the readable text comes back empty ' +
+    'or thin — and scroll first if the part you need is further down.',
+  tags: ['read'],
+  parameters: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      target: { type: 'string', description: 'Target id returned by browser_open or browser_tabs.' },
+    },
+    required: ['target'],
+  },
+};
+
+export const BROWSER_NAVIGATE_TOOL: ToolSpec = {
+  name: 'browser_navigate',
+  description:
+    'Move an existing tab to another address, or go back one entry. Use `browser_open` instead when you want ' +
+    'a second page at the same time. A URL without a scheme gets https:// in front of it.',
+  tags: ['act', 'snapshot'],
+  parameters: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      target: { type: 'string', description: 'Target id returned by browser_open or browser_tabs.' },
+      url: { type: 'string', description: 'Address to move to.' },
+      back: { type: 'boolean', description: 'Go back one entry in this tab\'s history instead.' },
+    },
+    required: ['target'],
+  },
+};
+
+export const BROWSER_TABS_TOOL: ToolSpec = {
+  name: 'browser_tabs',
+  description:
+    'List the pages open in the browser right now, each with its target id. ' +
+    'Entries are marked `mine: true` when you opened them — those are the only ones `browser_close` accepts. ' +
+    'When the browser is the operator\'s own, this also reports what changed since the previous call: the pages ' +
+    'he opened, moved or closed in between, as a net difference (a page he opened and closed in between leaves ' +
+    'no trace, and the browser\'s own pages never appear). ' +
+    'When it is your own instance, there is nobody else browsing in it, so no change section is reported.',
+  tags: ['read', 'snapshot'],
+  parameters: { type: 'object', additionalProperties: false, properties: {} },
+};
+
+export const BROWSER_FOCUS_TOOL: ToolSpec = {
+  name: 'browser_focus',
+  description:
+    'Bring one of your pages into the operator\'s view: its window is restored if it is minimized or hidden, moved back on screen, and raised above ' +
+    'whatever he is using. Use it when you actually want him to look at something. This is the only tool ' +
+    'that takes over his screen, so reach for it deliberately — your pages work fine, media included, while ' +
+    'they stay off screen, and this interrupts whatever he is doing (his keyboard focus usually stays where ' +
+    'it was, but that is not guaranteed). The receipt tells you the page\'s document.visibilityState ' +
+    'afterwards, which window it raised, and what (if anything) is sitting on top of it — only if that last ' +
+    'part says nothing is in the way can he really see it. When something is in the way (a topmost window ' +
+    'cannot be covered at all) or no window could be identified, do not retry in a loop: browser_shot is the ' +
+    'reliable way to show him instead.',
+  tags: ['act'],
+  parameters: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      target: { type: 'string', description: 'Target id returned by browser_open or browser_tabs.' },
+    },
+    required: ['target'],
+  },
+};
+
+export const BROWSER_CLOSE_TOOL: ToolSpec = {
+  name: 'browser_close',
+  description:
+    'Close a page you opened. Pages the operator opened are refused on purpose: closing one loses his state. ' +
+    'Your pages are also closed automatically when they sit idle, so this is for tidying up sooner than that.',
+  tags: ['act'],
+  parameters: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      target: { type: 'string', description: 'Target id of a page you opened.' },
+    },
+    required: ['target'],
+  },
+};
+
+export const BROWSER_FIND_URL_TOOL: ToolSpec = {
+  name: 'browser_find_url',
+  description:
+    'Search this machine\'s browser bookmarks and history for a URL. Use it when the target is something the ' +
+    'operator has visited — a page he mentions by name, an internal system no search engine can reach. ' +
+    'Keywords are AND-ed and match title and URL. Returns the tool\'s own listing text.',
+  tags: ['read', 'snapshot'],
+  parameters: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      keywords: { type: 'array', items: { type: 'string' }, description: 'Words to match, all of them.' },
+      only: { type: 'string', enum: ['bookmarks', 'history'], description: 'Search one source only.' },
+      browser: { type: 'string', enum: ['chrome', 'edge'], description: 'Limit to one browser\'s data.' },
+      limit: { type: 'integer', description: 'How many results; default 20 in the tool itself.' },
+      since: { type: 'string', description: 'History only: `1d`, `7h`, `30m` or `YYYY-MM-DD`.' },
+      sort: { type: 'string', enum: ['recent', 'visits'], description: 'History only: by last visit or by visit count.' },
+    },
+    required: [],
+  },
+};
+
 export class BrowserWorld implements World {
   readonly id = 'browser';
 
@@ -181,7 +456,7 @@ export class BrowserWorld implements World {
     };
   }
 
-  console(): WorldConsoleDecl {
+  webUi(): WorldWebUiDecl {
     const cfg = this.opts.cfg;
     return {
       lamps: [this.lamp()],
@@ -580,24 +855,7 @@ export class BrowserWorld implements World {
   }
 
   private openTool(): ToolDef {
-    return {
-      name: 'browser_open',
-      description:
-        'Open a page in a new background tab in the operator\'s own browser and return what the page shows: ' +
-        'title, URL, its readable text and its links. The tab carries the operator\'s login state. ' +
-        'Use the returned `target` value for every later call on that page. ' +
-        'A URL written without a scheme gets https:// in front of it.',
-      tags: ['act', 'snapshot'],
-      parameters: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          url: { type: 'string', description: 'Address to open, for example `example.com/report`.' },
-        },
-        required: ['url'],
-      },
-      handler: async (args, ctx) => this.open(args, ctx),
-    };
+    return { ...BROWSER_OPEN_TOOL, handler: async (args, ctx) => this.open(args, ctx) };
   }
 
   /**
@@ -610,223 +868,43 @@ export class BrowserWorld implements World {
    * 6 里量到过「JS 点击 → 新页面 0 个，真鼠标 → 1 个」；按地址开没有这一层。
    */
   private searchTool(): ToolDef {
-    return {
-      name: 'browser_search',
-      description:
-        'Search the web in this browser: opens the search engine\'s result page and returns the results as ' +
-        'addresses — title, URL and a short snippet each. Use it when the topic is vague and you do not know ' +
-        'which site to open; guessing domains or walking a site\'s own navigation is the other, worse way. ' +
-        'Default engine is Bing (China): Google and DuckDuckGo do not load from this machine. Sogou and Baidu ' +
-        'work but hand back their own redirect links. **Use the URLs**: open the one you want with browser_open ' +
-        '— clicking the result links on the page does not open a new page for them. The receipt names the ' +
-        'result page\'s `target`, so you can browser_read or browser_close it yourself.',
-      // 与 browser_open 同类：它会在她的浏览器里**开出一个页面**，所以是 act 不是纯 read。
-      tags: ['act', 'snapshot'],
-      parameters: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          query: { type: 'string', description: 'What to search for, words as a person would type them.' },
-          engine: { type: 'string', enum: ['bing', 'sogou', 'baidu'], description: 'Default comes from worlds.browser.searchEngine (bing).' },
-          count: { type: 'integer', description: `How many results to return; default ${SEARCH_COUNT_DEFAULT}, max ${SEARCH_COUNT_MAX}.` },
-        },
-        required: ['query'],
-      },
-      handler: async (args, ctx) => this.search(args, ctx),
-    };
+    return { ...BROWSER_SEARCH_TOOL, handler: async (args, ctx) => this.search(args, ctx) };
   }
 
   private readTool(): ToolDef {
-    return {
-      name: 'browser_read',
-      description:
-        'Read the readable text and links of a page you already opened, by `target`. ' +
-        'Pass `selector` to read one part of the page instead of the whole document. ' +
-        'Text reaching the limit is cut and flagged. `ready` is the document readyState, not proof the ' +
-        'content you want has appeared.',
-      tags: ['read', 'snapshot'],
-      parameters: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          target: { type: 'string', description: 'Target id returned by browser_open or browser_tabs.' },
-          selector: { type: 'string', description: 'CSS selector to read inside, for example `main article`.' },
-          maxChars: { type: 'integer', description: `How much text to return; default ${READ_TEXT_DEFAULT}, max ${READ_TEXT_MAX}.` },
-        },
-        required: ['target'],
-      },
-      handler: async (args, ctx) => this.read(args, ctx),
-    };
+    return { ...BROWSER_READ_TOOL, handler: async (args, ctx) => this.read(args, ctx) };
   }
 
   private jsTool(): ToolDef {
-    return {
-      name: 'browser_js',
-      description:
-        'Evaluate one JavaScript expression inside the page and return its value. This is the escape hatch when ' +
-        'the other tools do not cover what the page needs. Expressions only: to run several statements, wrap them ' +
-        'yourself as `(async () => { ... })()` and return a value. A thrown error comes back as a failed receipt. ' +
-        'The value must be JSON-serializable; DOM nodes and functions come back as their names.',
-      tags: ['act'],
-      parameters: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          target: { type: 'string', description: 'Target id returned by browser_open or browser_tabs.' },
-          expression: { type: 'string', description: 'JavaScript expression, for example `document.querySelectorAll("a").length`.' },
-        },
-        required: ['target', 'expression'],
-      },
-      handler: async (args, ctx) => this.js(args, ctx),
-    };
+    return { ...BROWSER_JS_TOOL, handler: async (args, ctx) => this.js(args, ctx) };
   }
 
   private clickTool(): ToolDef {
-    return {
-      name: 'browser_click',
-      description:
-        'Click the first element matching a CSS selector. Default is a JS click, which covers most cases. ' +
-        '`native: true` sends a real mouse event at the element\'s centre: use it when the page ignores a JS click, ' +
-        'when the click should count as a user gesture, or when it should open a file dialog. ' +
-        'A link that opens a new tab (`target=_blank`, which is what search result links are) opens **only** with ' +
-        '`native: true` — a JS click on it does nothing at all. When a click does open a new page, the receipt ' +
-        'names it, with its target id. ' +
-        'Returns what was clicked and the page\'s title and URL right after.',
-      tags: ['act'],
-      parameters: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          target: { type: 'string', description: 'Target id returned by browser_open or browser_tabs.' },
-          selector: { type: 'string', description: 'CSS selector of the element to click.' },
-          native: { type: 'boolean', description: 'Send a real mouse event instead of `el.click()`.' },
-        },
-        required: ['target', 'selector'],
-      },
-      handler: async (args, ctx) => this.click(args, ctx),
-    };
+    return { ...BROWSER_CLICK_TOOL, handler: async (args, ctx) => this.click(args, ctx) };
   }
 
   private typeTool(): ToolDef {
-    return {
-      name: 'browser_type',
-      description:
-        'Type a value into an input, textarea, select or contenteditable element, then fire input and change events ' +
-        'so frameworks notice. `submit: true` sends the value and submits: the containing form when there is one, ' +
-        'otherwise an Enter key press on the element.',
-      tags: ['act'],
-      parameters: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          target: { type: 'string', description: 'Target id returned by browser_open or browser_tabs.' },
-          selector: { type: 'string', description: 'CSS selector of the field.' },
-          value: { type: 'string', description: 'Text to put in, or the option of a select.' },
-          submit: { type: 'boolean', description: 'Submit after typing.' },
-        },
-        required: ['target', 'selector', 'value'],
-      },
-      handler: async (args, ctx) => this.type(args, ctx),
-    };
+    return { ...BROWSER_TYPE_TOOL, handler: async (args, ctx) => this.type(args, ctx) };
   }
 
   private uploadTool(): ToolDef {
-    return {
-      name: 'browser_upload',
-      description:
-        'Attach local files to a page\'s file input, bypassing the file dialog. ' +
-        '`files` are absolute paths on this machine — a file in your own workspace is one.',
-      tags: ['act'],
-      parameters: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          target: { type: 'string', description: 'Target id returned by browser_open or browser_tabs.' },
-          selector: { type: 'string', description: 'CSS selector of the `input[type=file]`.' },
-          files: { type: 'array', items: { type: 'string' }, description: 'Absolute paths to attach.' },
-        },
-        required: ['target', 'selector', 'files'],
-      },
-      handler: async (args, ctx) => this.upload(args, ctx),
-    };
+    return { ...BROWSER_UPLOAD_TOOL, handler: async (args, ctx) => this.upload(args, ctx) };
   }
 
   private scrollTool(): ToolDef {
-    return {
-      name: 'browser_scroll',
-      description:
-        'Scroll the page. `to: bottom` is the usual one: it loads lazy content, so images and later sections ' +
-        'exist in the DOM afterwards. `y` is the distance for `down` and `up`.',
-      tags: ['act'],
-      parameters: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          target: { type: 'string', description: 'Target id returned by browser_open or browser_tabs.' },
-          to: { type: 'string', enum: ['down', 'up', 'top', 'bottom'], description: 'Where to scroll; default `down`.' },
-          y: { type: 'integer', description: 'Pixels for `down` / `up`; default 3000.' },
-        },
-        required: ['target'],
-      },
-      handler: async (args, ctx) => this.scroll(args, ctx),
-    };
+    return { ...BROWSER_SCROLL_TOOL, handler: async (args, ctx) => this.scroll(args, ctx) };
   }
 
   private shotTool(): ToolDef {
-    return {
-      name: 'browser_shot',
-      description:
-        'Capture one screenshot of the page and attach it to the receipt. The image is the viewport, not the whole ' +
-        'document. Use it when the content is in images, canvas or video, where the readable text comes back empty ' +
-        'or thin — and scroll first if the part you need is further down.',
-      tags: ['read'],
-      parameters: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          target: { type: 'string', description: 'Target id returned by browser_open or browser_tabs.' },
-        },
-        required: ['target'],
-      },
-      handler: async (args, ctx) => this.shot(args, ctx),
-    };
+    return { ...BROWSER_SHOT_TOOL, handler: async (args, ctx) => this.shot(args, ctx) };
   }
 
   private navigateTool(): ToolDef {
-    return {
-      name: 'browser_navigate',
-      description:
-        'Move an existing tab to another address, or go back one entry. Use `browser_open` instead when you want ' +
-        'a second page at the same time. A URL without a scheme gets https:// in front of it.',
-      tags: ['act', 'snapshot'],
-      parameters: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          target: { type: 'string', description: 'Target id returned by browser_open or browser_tabs.' },
-          url: { type: 'string', description: 'Address to move to.' },
-          back: { type: 'boolean', description: 'Go back one entry in this tab\'s history instead.' },
-        },
-        required: ['target'],
-      },
-      handler: async (args, ctx) => this.navigate(args, ctx),
-    };
+    return { ...BROWSER_NAVIGATE_TOOL, handler: async (args, ctx) => this.navigate(args, ctx) };
   }
 
   private tabsTool(): ToolDef {
-    return {
-      name: 'browser_tabs',
-      description:
-        'List the pages open in the browser right now, each with its target id. ' +
-        'Entries are marked `mine: true` when you opened them — those are the only ones `browser_close` accepts. ' +
-        'When the browser is the operator\'s own, this also reports what changed since the previous call: the pages ' +
-        'he opened, moved or closed in between, as a net difference (a page he opened and closed in between leaves ' +
-        'no trace, and the browser\'s own pages never appear). ' +
-        'When it is your own instance, there is nobody else browsing in it, so no change section is reported.',
-      tags: ['read', 'snapshot'],
-      parameters: { type: 'object', additionalProperties: false, properties: {} },
-      handler: async () => this.tabs(),
-    };
+    return { ...BROWSER_TABS_TOOL, handler: async () => this.tabs() };
   }
 
   /**
@@ -838,73 +916,15 @@ export class BrowserWorld implements World {
    * "搬过去了"就等于"他看见了"（2026-10-01 之前就是这么栽的）。
    */
   private focusTool(): ToolDef {
-    return {
-      name: 'browser_focus',
-      description:
-        'Bring one of your pages into the operator\'s view: its window is restored if it is minimized or hidden, moved back on screen, and raised above ' +
-        'whatever he is using. Use it when you actually want him to look at something. This is the only tool ' +
-        'that takes over his screen, so reach for it deliberately — your pages work fine, media included, while ' +
-        'they stay off screen, and this interrupts whatever he is doing (his keyboard focus usually stays where ' +
-        'it was, but that is not guaranteed). The receipt tells you the page\'s document.visibilityState ' +
-        'afterwards, which window it raised, and what (if anything) is sitting on top of it — only if that last ' +
-        'part says nothing is in the way can he really see it. When something is in the way (a topmost window ' +
-        'cannot be covered at all) or no window could be identified, do not retry in a loop: browser_shot is the ' +
-        'reliable way to show him instead.',
-      tags: ['act'],
-      parameters: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          target: { type: 'string', description: 'Target id returned by browser_open or browser_tabs.' },
-        },
-        required: ['target'],
-      },
-      handler: async (args, ctx) => this.focus(args, ctx),
-    };
+    return { ...BROWSER_FOCUS_TOOL, handler: async (args, ctx) => this.focus(args, ctx) };
   }
 
   private closeTool(): ToolDef {
-    return {
-      name: 'browser_close',
-      description:
-        'Close a page you opened. Pages the operator opened are refused on purpose: closing one loses his state. ' +
-        'Your pages are also closed automatically when they sit idle, so this is for tidying up sooner than that.',
-      tags: ['act'],
-      parameters: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          target: { type: 'string', description: 'Target id of a page you opened.' },
-        },
-        required: ['target'],
-      },
-      handler: async (args, ctx) => this.close(args, ctx),
-    };
+    return { ...BROWSER_CLOSE_TOOL, handler: async (args, ctx) => this.close(args, ctx) };
   }
 
   private findUrlTool(): ToolDef {
-    return {
-      name: 'browser_find_url',
-      description:
-        'Search this machine\'s browser bookmarks and history for a URL. Use it when the target is something the ' +
-        'operator has visited — a page he mentions by name, an internal system no search engine can reach. ' +
-        'Keywords are AND-ed and match title and URL. Returns the tool\'s own listing text.',
-      tags: ['read', 'snapshot'],
-      parameters: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          keywords: { type: 'array', items: { type: 'string' }, description: 'Words to match, all of them.' },
-          only: { type: 'string', enum: ['bookmarks', 'history'], description: 'Search one source only.' },
-          browser: { type: 'string', enum: ['chrome', 'edge'], description: 'Limit to one browser\'s data.' },
-          limit: { type: 'integer', description: 'How many results; default 20 in the tool itself.' },
-          since: { type: 'string', description: 'History only: `1d`, `7h`, `30m` or `YYYY-MM-DD`.' },
-          sort: { type: 'string', enum: ['recent', 'visits'], description: 'History only: by last visit or by visit count.' },
-        },
-        required: [],
-      },
-      handler: async (args, ctx) => this.findUrl(args, ctx),
-    };
+    return { ...BROWSER_FIND_URL_TOOL, handler: async (args, ctx) => this.findUrl(args, ctx) };
   }
 
   // ——— 工具实现 ———
