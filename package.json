@@ -1,6 +1,6 @@
 {
   "name": "cortico-world-browser",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
   "description": "Cortico Browser World: browse the web and watch Bilibili videos with frames, subtitles and danmaku in one browser. 浏览网页与观看 B 站视频，共用浏览器和登录态。",
   "license": "MIT",
@@ -32,6 +32,7 @@
     "typecheck": "tsc --noEmit",
     "smoke": "tsx scripts/smoke.ts",
     "smoke:video": "tsx scripts/smoke-video.ts",
+    "smoke:search-ui": "node scripts/smoke-search-ui.mjs",
     "build:webui": "node scripts/build-webui.mjs",
     "prepack": "node scripts/build-webui.mjs"
   },

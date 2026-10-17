@@ -4,6 +4,7 @@ import { describeTools, type WorldDefinition } from 'cortico/world.ts';
 import { VIDEO_TOOL_DECLS } from './video/tools.ts';
 import { BROWSER_DEFAULTS, type BrowserConfigSection } from './config.ts';
 import { isSearchEngineId } from './search.ts';
+import { BROWSER_FETCH_TOOL } from './search-service.ts';
 import {
   BROWSER_CLICK_TOOL,
   BROWSER_CLOSE_TOOL,
@@ -86,7 +87,7 @@ export const BROWSER: WorldDefinition<BrowserConfigSection> = {
   },
 
   // `ctx.cfg` 是 `worlds.browser` 的活引用：热改的键现读即生效。
-  create: (ctx) => new BrowserWorld({ cfg: ctx.cfg, timezone: ctx.timezone }),
+  create: (ctx) => new BrowserWorld({ cfg: ctx.cfg, timezone: ctx.timezone, secret: name => ctx.secret(name), storeSecret: (name, value) => ctx.storeSecret(name, value) }),
 
   // 自描述：可能出现的全部工具与会推出的全部事件，不进提示词。
   // 两个工具**能不能用**按配置变（browser_focus 要有专属实例且 bringToFront 打开，
@@ -96,6 +97,7 @@ export const BROWSER: WorldDefinition<BrowserConfigSection> = {
       [
         BROWSER_OPEN_TOOL,
         BROWSER_SEARCH_TOOL,
+        BROWSER_FETCH_TOOL,
         BROWSER_READ_TOOL,
         BROWSER_JS_TOOL,
         BROWSER_CLICK_TOOL,
@@ -112,13 +114,14 @@ export const BROWSER: WorldDefinition<BrowserConfigSection> = {
       ],
       {
         ...Object.fromEntries(VIDEO_TOOL_DECLS.map(t => [t.name, t.description])),
+        browser_fetch: { zh: '用 DeepSeek 或 Tavily 抓取公开网页，返回 Markdown 正文。', en: 'Fetches public page content as Markdown through DeepSeek or Tavily.' },
         browser_open: {
           zh: '在他的浏览器里新开一个后台标签页打开地址，并读回标题、正文与链接。',
           en: 'Opens an address in a new background tab in his browser and reads back the title, text and links.',
         },
         browser_search: {
-          zh: '搜一次，把结果当一批地址交回来（默认 Bing）。',
-          en: 'Runs one search and hands the results back as a batch of addresses (Bing by default).',
+          zh: '按配置的引擎顺序搜索，返回标题、链接、摘要与实际引擎。',
+          en: 'Searches in configured engine order and returns titles, URLs, summaries and the actual engine.',
         },
         browser_read: {
           zh: '按 target 读一个已打开页面的正文与链接，给选择器就读那一块。',

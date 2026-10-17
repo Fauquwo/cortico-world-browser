@@ -1,14 +1,15 @@
 import { VIDEO_DEFAULTS, type VideoConfig } from './video/config.ts';
 import type { ConfigGroup } from 'cortico/core/types.ts';
 import { SEARCH_ENGINE_DEFAULT, type SearchEngineId } from './search.ts';
+import { SEARCH_DEFAULTS, type BrowserSearchConfig } from './search-settings.ts';
 
 /**
  * config.json 的 worlds.browser 段，默认禁用；bot 或部署可启用。
  *
- * 这一段没有密钥：连的是本机的一个 HTTP 服务（web-access 的 cdp-proxy），
- * 操作的是操作员自己那个浏览器。
+ * API 搜索的密钥经宿主 secret() 读取，值不写入配置。
  */
 export interface BrowserConfigSection {
+  search: BrowserSearchConfig;
   video: VideoConfig;
   enabled: boolean;
   /**
@@ -61,17 +62,12 @@ export interface BrowserConfigSection {
    * 这一项管的是"她可不可以打扰他"——关掉之后 `browser_focus` 会拒绝并说清。
    */
   bringToFront: boolean;
-  /**
-   * `browser_search` 默认用哪个搜索引擎（`bing` / `sogou` / `baidu`）。
-   *
-   * 2026-10-12 在这台机器上量到：Google 与 DuckDuckGo **打不开**，能用的是这三个。
-   * 默认 Bing 国内版，因为只有它把**真地址**给出来（搜狗与百度给的是它们自己的跳转链接，
-   * 从地址上看不出是哪个站点）。她调工具时可以用 `engine` 参数临时换一个。
-   */
+  /** 兼容旧部署；search.order 为空时的首选网页引擎。 */
   searchEngine: SearchEngineId;
 }
 
 export const BROWSER_DEFAULTS: BrowserConfigSection = {
+  search: structuredClone(SEARCH_DEFAULTS),
   video: structuredClone(VIDEO_DEFAULTS),
   enabled: false,
   skillDir: '',
@@ -171,12 +167,9 @@ export const BROWSER_CONFIG_GROUP: ConfigGroup = {
       },
       'worlds.browser.searchEngine': {
         type: 'string',
-        title: '搜索用哪个引擎',
+        title: '旧配置的默认搜索引擎',
         description:
-          'browser_search 默认用哪个：bing（国内版，默认）/ sogou / baidu。' +
-          '这台机器上 Google 与 DuckDuckGo 打不开，别选它们。' +
-          'Bing 给的是真地址；搜狗与百度给的是它们自己的跳转链接（打开会落到真页，但从地址上看不出站点）。' +
-          '她可以按次用 engine 参数覆盖这一项，所以这里只是默认值。',
+          '仅在新引擎顺序为空时生效。请在「搜索设置」面板排序并启用引擎。',
         enum: ['bing', 'sogou', 'baidu'],
         'x-hot': true,
       },

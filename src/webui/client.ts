@@ -4,6 +4,7 @@
  * declared here; the browser side imports no Node module.
  */
 import type { WebUiClientBundle, WebUiPanel, WebUiPanelContext } from 'cortico/web/shared/client-panel.ts';
+import { searchPanel } from './search-panel.ts';
 
 interface AuthState {
   status: 'none' | 'pending' | 'scanned' | 'authorized' | 'expired' | 'error';
@@ -175,6 +176,6 @@ const playerPanel: WebUiPanel = {
   },
 };
 
-const bundle: WebUiClientBundle = { panels: { auth: authPanel, player: playerPanel } };
+const bundle: WebUiClientBundle = { panels: { search: searchPanel, auth: authPanel, player: playerPanel } };
 
 export default bundle;

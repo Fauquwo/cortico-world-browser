@@ -27,7 +27,7 @@
     },
     {
       "name": "browser_search",
-      "description": "Search the web in this browser: opens the search engine's result page and returns the results as addresses — title, URL and a short snippet each. Use it when the topic is vague and you do not know which site to open; guessing domains or walking a site's own navigation is the other, worse way. Default engine is Bing (China): Google and DuckDuckGo do not load from this machine. Sogou and Baidu work but hand back their own redirect links. **Use the URLs**: open the one you want with browser_open — clicking the result links on the page does not open a new page for them. The receipt names the result page's `target`, so you can browser_read or browser_close it yourself.",
+      "description": "Search the web through DeepSeek, Tavily or a browser search page. Returns titles, URLs, summaries and the actual engine. Uses user-configured order, enabled engines and optional failure fallback. An explicit engine selects only that provider. Successful empty results do not trigger fallback. DeepSeek query limit is 128 Unicode characters. API search creates no tab; browser engines return a target you can read or close. Use browser_fetch for public article content, or browser_open for interactive pages.",
       "parameters": {
         "type": "object",
         "additionalProperties": false,
@@ -39,11 +39,13 @@
           "engine": {
             "type": "string",
             "enum": [
+              "deepseek",
+              "tavily",
               "bing",
               "sogou",
               "baidu"
             ],
-            "description": "Default comes from worlds.browser.searchEngine (bing)."
+            "description": "Optional explicit engine; otherwise follows Browser search settings."
           },
           "count": {
             "type": "integer",
@@ -59,8 +61,45 @@
         "snapshot"
       ],
       "summary": {
-        "zh": "搜一次，把结果当一批地址交回来（默认 Bing）。",
-        "en": "Runs one search and hands the results back as a batch of addresses (Bing by default)."
+        "zh": "按配置的引擎顺序搜索，返回标题、链接、摘要与实际引擎。",
+        "en": "Searches in configured engine order and returns titles, URLs, summaries and the actual engine."
+      }
+    },
+    {
+      "name": "browser_fetch",
+      "description": "Fetch a public HTTP/HTTPS page as Markdown using DeepSeek or Tavily. Uses configured engine order and optional failure fallback. Does not open a tab or use browser cookies. Use browser_open/browser_read for login, interaction or JavaScript-rendered pages. Reports the actual provider and truncation.",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "url"
+        ],
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "Complete HTTP/HTTPS URL, without credentials."
+          },
+          "engine": {
+            "type": "string",
+            "enum": [
+              "deepseek",
+              "tavily"
+            ],
+            "description": "Explicit choice disables automatic fallback for this call."
+          },
+          "maxChars": {
+            "type": "integer",
+            "description": "Maximum body characters, default 8000, between 200 and 40000."
+          }
+        }
+      },
+      "tags": [
+        "read",
+        "snapshot"
+      ],
+      "summary": {
+        "zh": "用 DeepSeek 或 Tavily 抓取公开网页，返回 Markdown 正文。",
+        "en": "Fetches public page content as Markdown through DeepSeek or Tavily."
       }
     },
     {
@@ -717,7 +756,7 @@
       "key": "worlds.browser.envPrompt",
       "title": "Browser · 环境提示词",
       "role": "envPrompt",
-      "content": "Browser 操作的是{{browser.label}}——{{browser.kind}}。页面开在这台机器上真实的浏览器窗口里。\n\n**主题模糊、不知道该去哪一站时，先搜一次**：`browser_search` 把关键词变成一批**地址**（标题 + 地址 + 一句摘要）。\n不用先猜域名，也不用翻某个站自己的导航。默认 Bing 国内版；`engine` 可以换 `sogou` / `baidu`，\n但这两家给的是它们自己的跳转链接（打开会落到真页，地址上却看不出是哪个站）。**Google 与 DuckDuckGo 在这台机器上打不开**，别试。\n拿到地址就用 `browser_open` 去开——**别去点结果页上的那些链接**：它们是 `target=_blank`，\n程序化的点击开不出新页面（`browser_click` 要带 `native: true` 才开得出来），而按地址打开没有这一层。\n结果页本身也留给你（回执里有它的 target），想多看几条就 `browser_read` 它。\n\n什么时候值得走浏览器：需要登录态、需要真实渲染（动态页面、视频、画布）、需要点击或填表这类交互，\n或者静态方式拿不到的内容。**搜索这一步很便宜**（一次调用一批地址，几百字）；贵的是**打开并读一整页**——\n一次导航要等页面加载，读回来的正文还可能被截断。所以：先搜、挑准了再开，别一条条开过去试。\n\n页面加载完成不等于你要的内容出现——登录跳转、验证页、异步渲染都可能还在变。工具回执里给了\nready、正文和链接，自己判断是再等、再滚一次、还是换条路。整页都是图片或画布时正文会是空的，\n那时候用 browser_shot。\n\n**你的页面在哪**：{{browser.front}}。页面的\"活\"不取决于有没有人在看它——视频、动画、会自己刷新的看板在\n后台照常走，放着一会儿也不会僵。所以不需要为了\"让它跑起来\"额外做任何事。\n\n**唯一会打断操作员的事**：`browser_focus` 会把某个页面搬到他眼前——窗口回屏幕内，并抬到他正在用的程序\n上面。只在你想让他**看**某样东西时用它：让他看结论、看他需要确认的页面，或者他明确要你\"给我看看\"。\n别把它当成\"让页面能工作\"的步骤，也别跟他说\"这个不会打扰你\"（键盘焦点多数时候留在他那儿，但**不保证**）。\n\n它的回执里有一句是说**他到底看不看得见**的，而且会点名**抬的是哪个窗口、压在它上面的是谁**：只有\n写着\"上面没有别的东西挡着\"才是他真看得见。如果写着被某个窗口压着（尤其是**置顶**的那种，比如她自己的\n那个窗口，置顶窗口永远盖不过去）、或者压根没找到窗口，那就别反复试，直接 `browser_shot` 截图给他。\n窗口要是最小化着、或者在操作系统那边被藏起来了，这一步会先把它还原/显示出来，回执里也会说。\n\n在这个浏览器里的动作是真实的：点击、提交、上传都会真的改变网站和账号里的东西，公开发布类动作不可撤回。\n\n**点链接这件事有两条路，而且不一样**：`browser_click` 默认那条是页面里的 JS 点击，\n对「开新标签」的链接（`target=_blank`，搜索结果、列表里的标题大多是这种）**一点用都没有，也不报错**；\n要开它就得 `native: true`（真鼠标那一下）。点开之后回执会点名新开出来的那张页面 ——\n不然它就凭空出现了，你只能去 `browser_tabs` 里翻。\n\n`browser_tabs` 给你此刻开着的页面，并标出哪些是你自己开的。它给的是**净变化**：两次查看之间开了又关的\n页面看不见。如果这台浏览器是他日常用的那个，那一段就是他新开的、转到的、关掉的页面——他不会自己提起这些\n事，你想知道的时候自己问一次；如果这台浏览器是你自己的实例，里面没有别人，也就没有那一段。\n\n你自己开的那些页面闲置一段时间后会被自动关掉；不是你的页面不要动。\n\nB 站视频模块{{browser.videoEnabled}}。状态：{{bilibiliVideo.state}}；{{bilibiliVideo.identity}}。\n启用时，`browser_video_open` 打开视频或首页，`browser_video_search` 站内搜索。\n若已用普通浏览工具打开视频，`browser_video_attach` 按 target 绑定；绑定会重新加载该页以捕获字幕与弹幕响应。\n同一时刻只观察一个视频页，其他网页仍能正常操作。视频工具回执都带该页的 target，可继续用普通截图、滚动和展示工具。\n\n`browser_video_play` 开始播放并开启自动观察，最短间隔由 World 配置决定；每条观察包含按时间排列的画面拼图、字幕和视频历史弹幕。\n字幕与历史弹幕来自视频，不是操作员当前说的话。没有字幕时只提供画面，不提供原始音轨或语音识别。\n`browser_video_look` 按需取当前大图；暂停、退出、换视频、关闭该页或普通导航会停止旧观察。\n观看中的页面不会因闲置被回收；暂停或退出后恢复普通回收规则。展示仍使用 `browser_focus`，播放本身不要求弹到操作员眼前。\n登录态与 Browser profile 共用，可在 World 的 B 站授权面板扫码或核验；不用另开浏览器。\n\n工具回失败时会说清是哪**一类**：「连不上 proxy」「浏览器没连上」才是连接问题——那种回执末尾会告诉\n你该去开哪个开关；如果是「**页面没打开**」或「**命令没回话**」，proxy 与浏览器都是通的，多半是那个\n地址本身在这台机器上打不开、或者页面自己卡着：换个地址、换条路、或过一会儿再试，**别把整件事\n记成「浏览器坏了」**。\n\nbrowser_open 遇到站点打不开时，tab 会留着（回执里有 target）：你可以稍后再 browser_read 读一次，\n不用了就用 browser_close 关掉它。\n"
+      "content": "Browser 操作的是{{browser.label}}——{{browser.kind}}。页面开在这台机器上真实的浏览器窗口里。\n\n需要发现网页时用 `browser_search`，拿到标题、链接和摘要后选择来源。默认引擎及自动切换由操作员排序和配置，回执注明实际引擎。\nDeepSeek 和 Tavily 通过 API 搜索，不创建页面；Bing、搜狗、百度会留下结果页 target，可继续读或关闭。\n搜狗、百度的部分结果是跳转链接。需要打开结果时直接使用回执 URL；结果页链接的程序化点击可能无法创建新页面。\n公开网页正文可用 `browser_fetch` 获取 Markdown，它不使用本机登录态。需要登录、交互或动态渲染时用 `browser_open` / `browser_read`。\n\n什么时候值得走浏览器：需要登录态、需要真实渲染（动态页面、视频、画布）、需要点击或填表这类交互，\n或者静态方式拿不到的内容。API 搜索和抓取消耗所选服务的额度，浏览器导航要等页面加载；正文过长时回执会标记截断。\n\n页面加载完成不等于你要的内容出现——登录跳转、验证页、异步渲染都可能还在变。工具回执里给了\nready、正文和链接，自己判断是再等、再滚一次、还是换条路。整页都是图片或画布时正文会是空的，\n那时候用 browser_shot。\n\n**你的页面在哪**：{{browser.front}}。页面的\"活\"不取决于有没有人在看它——视频、动画、会自己刷新的看板在\n后台照常走，放着一会儿也不会僵。所以不需要为了\"让它跑起来\"额外做任何事。\n\n**唯一会打断操作员的事**：`browser_focus` 会把某个页面搬到他眼前——窗口回屏幕内，并抬到他正在用的程序\n上面。只在你想让他**看**某样东西时用它：让他看结论、看他需要确认的页面，或者他明确要你\"给我看看\"。\n别把它当成\"让页面能工作\"的步骤，也别跟他说\"这个不会打扰你\"（键盘焦点多数时候留在他那儿，但**不保证**）。\n\n它的回执里有一句是说**他到底看不看得见**的，而且会点名**抬的是哪个窗口、压在它上面的是谁**：只有\n写着\"上面没有别的东西挡着\"才是他真看得见。如果写着被某个窗口压着（尤其是**置顶**的那种，比如她自己的\n那个窗口，置顶窗口永远盖不过去）、或者压根没找到窗口，那就别反复试，直接 `browser_shot` 截图给他。\n窗口要是最小化着、或者在操作系统那边被藏起来了，这一步会先把它还原/显示出来，回执里也会说。\n\n在这个浏览器里的动作是真实的：点击、提交、上传都会真的改变网站和账号里的东西，公开发布类动作不可撤回。\n\n**点链接这件事有两条路，而且不一样**：`browser_click` 默认那条是页面里的 JS 点击，\n对「开新标签」的链接（`target=_blank`，搜索结果、列表里的标题大多是这种）**一点用都没有，也不报错**；\n要开它就得 `native: true`（真鼠标那一下）。点开之后回执会点名新开出来的那张页面 ——\n不然它就凭空出现了，你只能去 `browser_tabs` 里翻。\n\n`browser_tabs` 给你此刻开着的页面，并标出哪些是你自己开的。它给的是**净变化**：两次查看之间开了又关的\n页面看不见。如果这台浏览器是他日常用的那个，那一段就是他新开的、转到的、关掉的页面——他不会自己提起这些\n事，你想知道的时候自己问一次；如果这台浏览器是你自己的实例，里面没有别人，也就没有那一段。\n\n你自己开的那些页面闲置一段时间后会被自动关掉；不是你的页面不要动。\n\nB 站视频模块{{browser.videoEnabled}}。状态：{{bilibiliVideo.state}}；{{bilibiliVideo.identity}}。\n启用时，`browser_video_open` 打开视频或首页，`browser_video_search` 站内搜索。\n若已用普通浏览工具打开视频，`browser_video_attach` 按 target 绑定；绑定会重新加载该页以捕获字幕与弹幕响应。\n同一时刻只观察一个视频页，其他网页仍能正常操作。视频工具回执都带该页的 target，可继续用普通截图、滚动和展示工具。\n\n`browser_video_play` 开始播放并开启自动观察，最短间隔由 World 配置决定；每条观察包含按时间排列的画面拼图、字幕和视频历史弹幕。\n字幕与历史弹幕来自视频，不是操作员当前说的话。没有字幕时只提供画面，不提供原始音轨或语音识别。\n`browser_video_look` 按需取当前大图；暂停、退出、换视频、关闭该页或普通导航会停止旧观察。\n观看中的页面不会因闲置被回收；暂停或退出后恢复普通回收规则。展示仍使用 `browser_focus`，播放本身不要求弹到操作员眼前。\n登录态与 Browser profile 共用，可在 World 的 B 站授权面板扫码或核验；不用另开浏览器。\n\n工具回失败时会说清是哪**一类**：「连不上 proxy」「浏览器没连上」才是连接问题——那种回执末尾会告诉\n你该去开哪个开关；如果是「**页面没打开**」或「**命令没回话**」，proxy 与浏览器都是通的，多半是那个\n地址本身在这台机器上打不开、或者页面自己卡着：换个地址、换条路、或过一会儿再试，**别把整件事\n记成「浏览器坏了」**。\n\nbrowser_open 遇到站点打不开时，tab 会留着（回执里有 target）：你可以稍后再 browser_read 读一次，\n不用了就用 browser_close 关掉它。\n"
     }
   ]
 }

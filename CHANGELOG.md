@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0
+
+- 网页搜索新增 DeepSeek 和 Tavily，按用户设置的优先级、启用状态和密钥选择引擎。
+- 搜索设置面板支持拖拽及上下移动，分别保存两家 API key 到部署 .env，排序与开关下次调用生效。
+- 可选失败自动切换；无结果、鉴权/额度错误及取消时停止，显式选引擎不切换。
+- 新增 `browser_fetch`，通过 DeepSeek Fetch 或 Tavily Extract 返回公开网页 Markdown 正文。
+- 旧部署保留原 searchEngine 的优先级；停止 World 时取消 API 请求。
+
 ## 0.2.0
 
 - Browser 内加入 B 站视频模块，共用浏览器、页面登记和 profile 登录态。

@@ -25,6 +25,7 @@ import { nowIso } from 'cortico/core/util.ts';
 import { CdpRelay, RelayError, classifyRelayError, runFindUrl, type EvalResult, type PageTarget, type RelayFailureKind, type RelayHealth } from './cdp-client.ts';
 import { BilibiliSession, isBilibili } from './video/session.ts';
 import { VIDEO_DEFAULTS } from './video/config.ts';
+import { BrowserSearchService, BROWSER_FETCH_TOOL, type SearchServiceOptions } from './search-service.ts';
 import { BROWSER_CONFIG_GROUP, type BrowserConfigSection } from './config.ts';
 import { OwnBrowser, createWindow, showTarget } from './own-browser.ts';
 import { raiseSentence, type RaiseResult } from './window-raise.ts';
@@ -32,9 +33,7 @@ import { readExpression, typeExpression } from './page-scripts.ts';
 import {
   SEARCH_COUNT_DEFAULT,
   SEARCH_COUNT_MAX,
-  SEARCH_ENGINE_DEFAULT,
   clampCount,
-  isSearchEngineId,
   normalizeHarvest,
   renderSearch,
   searchExpression,
@@ -123,6 +122,9 @@ export interface BrowserWorldOptions {
   /** `worlds.browser` 的活引用。 */
   cfg: BrowserConfigSection;
   timezone: string;
+  secret?: SearchServiceOptions['secret'];
+  storeSecret?: SearchServiceOptions['storeSecret'];
+  request?: typeof fetch;
 }
 
 /**
@@ -151,21 +153,18 @@ export const BROWSER_OPEN_TOOL: ToolSpec = {
 export const BROWSER_SEARCH_TOOL: ToolSpec = {
   name: 'browser_search',
   description:
-    'Search the web in this browser: opens the search engine\'s result page and returns the results as ' +
-    'addresses — title, URL and a short snippet each. Use it when the topic is vague and you do not know ' +
-    'which site to open; guessing domains or walking a site\'s own navigation is the other, worse way. ' +
-    'Default engine is Bing (China): Google and DuckDuckGo do not load from this machine. Sogou and Baidu ' +
-    'work but hand back their own redirect links. **Use the URLs**: open the one you want with browser_open ' +
-    '— clicking the result links on the page does not open a new page for them. The receipt names the ' +
-    'result page\'s `target`, so you can browser_read or browser_close it yourself.',
-  // 与 browser_open 同类：它会在她的浏览器里**开出一个页面**，所以是 act 不是纯 read。
+    'Search the web through DeepSeek, Tavily or a browser search page. Returns titles, URLs, summaries and the actual engine. ' +
+    'Uses user-configured order, enabled engines and optional failure fallback. An explicit engine selects only that provider. ' +
+    'Successful empty results do not trigger fallback. DeepSeek query limit is 128 Unicode characters. ' +
+    'API search creates no tab; browser engines return a target you can read or close. Use browser_fetch for public article content, or browser_open for interactive pages.',
+  // 网页引擎会创建页面，因此工具保留 act 标签。
   tags: ['act', 'snapshot'],
   parameters: {
     type: 'object',
     additionalProperties: false,
     properties: {
       query: { type: 'string', description: 'What to search for, words as a person would type them.' },
-      engine: { type: 'string', enum: ['bing', 'sogou', 'baidu'], description: 'Default comes from worlds.browser.searchEngine (bing).' },
+      engine: { type: 'string', enum: ['deepseek', 'tavily', 'bing', 'sogou', 'baidu'], description: 'Optional explicit engine; otherwise follows Browser search settings.' },
       count: { type: 'integer', description: `How many results to return; default ${SEARCH_COUNT_DEFAULT}, max ${SEARCH_COUNT_MAX}.` },
     },
     required: ['query'],
@@ -428,7 +427,10 @@ export class BrowserWorld implements World {
   /** proxy 掉了之后补拉过一次就不再试了。 */
   private recoveryTried = false;
 
+  private readonly searchService: BrowserSearchService;
+
   constructor(private readonly opts: BrowserWorldOptions) {
+    this.searchService = new BrowserSearchService(opts);
     const cfg = opts.cfg;
     cfg.video ??= structuredClone(VIDEO_DEFAULTS);
     this.own = cfg.ownBrowser
@@ -477,9 +479,10 @@ export class BrowserWorld implements World {
   webUi(): WorldWebUiDecl {
     const cfg = this.opts.cfg;
     const video = this.video.webUi();
+    const search = this.searchService.webUi();
     return {
-      panels: cfg.video.enabled ? video.panels : [],
-      invoke: video.invoke,
+      panels: [...(search.panels ?? []), ...(cfg.video.enabled ? video.panels ?? [] : [])],
+      invoke: (panel, method, args) => panel === 'search' ? search.invoke!(panel, method, args) : video.invoke!(panel, method, args),
       lamps: [this.lamp(), ...(cfg.video.enabled ? video.lamps ?? [] : [])],
       badges: [
         { label: '浏览器', value: this.browserLabel || displayBrowser(cfg.browser) || '未配置', tone: 'plain' },
@@ -489,7 +492,7 @@ export class BrowserWorld implements World {
         { label: 'proxy', value: `127.0.0.1:${cfg.port}`, tone: 'plain' },
         { label: '她开的页', value: this.mine.size, tone: 'plain' },
       ],
-      config: [BROWSER_CONFIG_GROUP, ...(video.config ?? [])],
+      config: [BROWSER_CONFIG_GROUP, ...(search.config ?? []), ...(video.config ?? [])],
       promptDocs: [
         {
           key: 'worlds.browser.envPrompt',
@@ -513,6 +516,7 @@ export class BrowserWorld implements World {
   }
 
   async start(host: WorldHost): Promise<void> {
+    this.searchService.start();
     this.host = host;
     this.running = true;
     if (this.opts.cfg.video.enabled) await this.video.start(host);
@@ -602,6 +606,7 @@ export class BrowserWorld implements World {
   }
 
   async stop(): Promise<void> {
+    this.searchService.stop();
     this.running = false;
     await this.video.stop();
     await this.relay.stop(); // 只关自己拉起的那个
@@ -885,6 +890,7 @@ export class BrowserWorld implements World {
     const defs: ToolDef[] = [
       this.openTool(),
       this.searchTool(),
+      { ...BROWSER_FETCH_TOOL, handler: (args, ctx) => this.searchService.fetchPage(args, ctx) },
       this.readTool(),
       this.jsTool(),
       this.clickTool(),
@@ -1038,14 +1044,11 @@ export class BrowserWorld implements World {
    * 然后注入抽取函数，把结果整理成一批地址。抽不到就把整页正文交回去——别让她空手。
    */
   private async search(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {
+    return this.searchService.search(args, ctx, (engine, searchCtx) => this.searchPage(args, engine, searchCtx));
+  }
+
+  private async searchPage(args: Record<string, unknown>, engine: SearchEngineId, ctx: ToolCallContext): Promise<ToolOutcome> {
     const query = str(args.query);
-    if (!query) return fail('query 是空的：给一个要搜的词。');
-    const asked = str(args.engine);
-    const engine: SearchEngineId = isSearchEngineId(asked)
-      ? asked
-      : isSearchEngineId(String(this.opts.cfg.searchEngine))
-        ? (this.opts.cfg.searchEngine as SearchEngineId)
-        : SEARCH_ENGINE_DEFAULT;
     const count = clampCount(typeof args.count === 'number' ? args.count : undefined);
     const notReady = await this.ensureReady();
     if (notReady) return fail(notReady);

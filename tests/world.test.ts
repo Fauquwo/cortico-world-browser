@@ -314,6 +314,7 @@ describe('Browser World', () => {
     expect(tools.map((tool) => tool.name)).toEqual([
       'browser_open',
       'browser_search',
+      'browser_fetch',
       'browser_read',
       'browser_js',
       'browser_click',
@@ -1175,7 +1176,7 @@ describe('搜索', () => {
     expect(out.text).toContain('这是一段正文'); // 退回来的整页正文
   });
 
-  it('browser_search：query 空着时直接失败；引擎名不认识时落到配置的默认值', async () => {
+  it('browser_search：空查询和未知引擎失败；不指定时沿用旧默认值', async () => {
     const proxy = await fakeProxy();
     proxy.evalReply = (expression) => (isHarvest(expression) ? { ok: true, value: HITS } : PAGE_DUMP);
     const world = startedWorld(proxy.port, { skillDir: scratchDir, searchEngine: 'sogou' });
@@ -1185,8 +1186,11 @@ describe('搜索', () => {
     expect(blank.failed).toBe(true);
     expect(blank.text).toContain('query 是空的');
 
-    const out = await call(world, 'browser_search', { query: '机械键盘', engine: 'google' });
-    expect(proxy.navBodies.at(-1)).toContain('sogou.com/web?query='); // 认不出的名字不生效，走配置
+    const invalid = await call(world, 'browser_search', { query: '机械键盘', engine: 'google' });
+    expect(invalid.failed).toBe(true);
+    expect(proxy.navBodies).toHaveLength(0);
+    const out = await call(world, 'browser_search', { query: '机械键盘' });
+    expect(proxy.navBodies.at(-1)).toContain('sogou.com/web?query=');
     expect(out.text).toContain('搜狗');
   });
 });
