@@ -1,7 +1,10 @@
 {
   "name": "cortico-world-browser",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "type": "module",
+  "author": {
+    "name": "筆離嘢"
+  },
   "description": "Cortico World: 浏览器 —— 她能搜索、开页、读页、点击、填表、上传、截图，也能陪看 B 站视频（画面拼图、字幕与弹幕），共用浏览器与登录态。要求 Cortico 0.2.0 及以上。",
   "license": "MIT",
   "repository": {
