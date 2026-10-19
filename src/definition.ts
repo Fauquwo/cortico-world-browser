@@ -37,7 +37,7 @@ export const BROWSER: WorldDefinition<BrowserConfigSection> = {
   preflight: (ctx) => {
     const skillDir = ctx.cfg.skillDir.trim();
     if (!skillDir) {
-      throw new Error('worlds.browser.skillDir 没配。填上装了 web-access 的目录（例如 F:\\ai\\web-access）。');
+      throw new Error('worlds.browser.skillDir 没配。填上装了 web-access 的目录（例如 C:\\tools\\web-access）。');
     }
     if (!existsSync(skillDir)) {
       throw new Error(`worlds.browser.skillDir 指向的目录不存在：${skillDir}`);

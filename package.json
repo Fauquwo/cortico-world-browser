@@ -2,11 +2,27 @@
   "name": "cortico-world-browser",
   "version": "0.3.0",
   "type": "module",
-  "description": "Cortico Browser World: browse the web and watch Bilibili videos with frames, subtitles and danmaku in one browser. 浏览网页与观看 B 站视频，共用浏览器和登录态。",
+  "description": "Cortico World: 浏览器 —— 她能搜索、开页、读页、点击、填表、上传、截图，也能陪看 B 站视频（画面拼图、字幕与弹幕），共用浏览器与登录态。要求 Cortico 0.2.0 及以上。",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/biliye/cortico-world-browser.git"
+  },
+  "homepage": "https://github.com/biliye/cortico-world-browser#readme",
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
   "keywords": [
     "cortico-world",
-    "cortico"
+    "cortico",
+    "browser",
+    "web",
+    "puppeteer",
+    "bilibili",
+    "video",
+    "search",
+    "danmaku"
   ],
   "engines": {
     "node": ">=22"
@@ -16,16 +32,36 @@
   "cortico": {
     "kind": "world",
     "api": 6,
+    "displayName": "浏览器",
+    "icon": "assets/icon.svg",
+    "tags": [
+      "internet",
+      "browser",
+      "video",
+      "external-setup",
+      "high-cost"
+    ],
+    "locales": {
+      "en": {
+        "displayName": "Browser",
+        "description": "Cortico World: a managed browser the bot can search, open, read, click, fill, upload and screenshot, plus Bilibili video watching with frame mosaics, subtitles and danmaku. Requires Cortico 0.2.0 or later."
+      }
+    },
+    "screenshots": [
+      "assets/screenshot-search-settings.png"
+    ],
     "describe": "describe.json",
     "webUiClient": "dist/webui.js"
   },
   "files": [
     "src",
+    "dist",
+    "assets",
     "README.md",
     "describe.json",
-    "dist",
     "THIRD_PARTY_NOTICES.md",
-    "CHANGELOG.md"
+    "CHANGELOG.md",
+    "LICENSE"
   ],
   "scripts": {
     "test": "vitest run",
@@ -34,7 +70,8 @@
     "smoke:video": "tsx scripts/smoke-video.ts",
     "smoke:search-ui": "node scripts/smoke-search-ui.mjs",
     "build:webui": "node scripts/build-webui.mjs",
-    "prepack": "node scripts/build-webui.mjs"
+    "prepack": "node scripts/build-webui.mjs",
+    "prepublishOnly": "npm run typecheck && npm run test"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

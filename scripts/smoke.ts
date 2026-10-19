@@ -4,7 +4,7 @@
  * 两种用法：
  *
  *   1) 借操作员日常那个浏览器（原样，没变）：
- *      pnpm smoke [--skill-dir F:\ai\web-access] [--browser chrome] [--port 3517] [--url https://example.com]
+ *      pnpm smoke [--skill-dir C:\tools\web-access] [--browser chrome] [--port 3517] [--url https://example.com]
  *
  *   2) 她自己的实例（2026-10-01 加的那条路）：
  *      pnpm smoke --own [--exe <chrome.exe>] [--home <她的"家">] [--cdp-port 9223] [--port 3517]
@@ -43,7 +43,7 @@ function flag(name: string): boolean {
   return process.argv.slice(2).includes(`--${name}`);
 }
 
-const skillDir = arg('skill-dir', 'F:\\ai\\web-access');
+const skillDir = arg('skill-dir', 'C:\\tools\\web-access');
 const browser = arg('browser', 'chrome');
 const port = Number(arg('port', '3517'));
 const own = flag('own');

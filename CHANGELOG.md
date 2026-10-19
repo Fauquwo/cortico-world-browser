@@ -7,6 +7,7 @@
 - 可选失败自动切换；无结果、鉴权/额度错误及取消时停止，显式选引擎不切换。
 - 新增 `browser_fetch`，通过 DeepSeek Fetch 或 Tavily Extract 返回公开网页 Markdown 正文。
 - 旧部署保留原 searchEngine 的优先级；停止 World 时取消 API 请求。
+- 补齐市场发布元数据：显示名、图标、中英文简介、标签、截图、LICENSE 与发布前检查。
 
 ## 0.2.0
 

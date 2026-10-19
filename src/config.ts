@@ -95,7 +95,7 @@ export const BROWSER_CONFIG_GROUP: ConfigGroup = {
       'worlds.browser.skillDir': {
         type: 'string',
         title: 'web-access 目录',
-        description: '里面有 scripts/cdp-proxy.mjs，例如 F:\\ai\\web-access。必填。改完要重启这个 World 才生效。',
+        description: '里面有 scripts/cdp-proxy.mjs，例如 C:\\tools\\web-access。必填。改完要重启这个 World 才生效。',
         'x-hot': false,
       },
       'worlds.browser.browser': {

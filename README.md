@@ -15,6 +15,41 @@ bot 能在浏览器里搜索、开页、读页、点击、填表、上传、滚�
   她要打断他时才用 `browser_focus` 把某个页面搬到他眼前。代价是登录态不共享，要用的站点得在这个
   profile 里登一次。
 
+## 市场标签
+
+按官方索引仓的 [TAGS.md](https://github.com/Pal-AI-Lab/cortico-extensions/blob/main/TAGS.md) 声明了五个标签：
+
+- **`internet`**：搜索、抓取正文、读网页 —— 词表里「让 bot 读取或操作互联网内容」；
+- **`browser`**：真正操作一个浏览器（开页、点击、填表、截图），不是只调 HTTP 接口；
+- **`video`**：陪看 B 站视频、读字幕与弹幕；
+- **`external-setup`**：装完包还不够，要先装上游 [web-access](https://github.com/eze-is/web-access) 并配好远程调试；
+- **`high-cost`**（提示级）：观看视频时每 15 秒投一张画面拼图，还会读字幕与弹幕，token 消耗比普通工具快。
+
+没有声明警示标签：它不持续读取屏幕或键鼠，截图与页面内容只在工具被调用时产生。卡片图标是包内
+`assets/icon.svg`，英文界面显示 `Browser`（`cortico.locales.en`）。
+
+## 怎么装
+
+要求 **Cortico 0.2.0 及以上**（扩展契约 `world` 6；0.1.x 不认识这个版本号，装载时直接拒绝）。
+
+- **扩展市场**：控制台「扩展 → 扩展市场」搜 `cortico-world-browser`，点安装，然后重启进程。
+  npm 上的包已经带好 `dist/webui.js`，不用自己构建。
+- **手动**：在部署目录里 `corepack pnpm add --ignore-workspace cortico-world-browser --registry=https://registry.npmjs.org/`
+  （本机默认源常是只读镜像，要显式指官方源），或在控制台里安装本包目录。
+
+装完还要做两件事，否则 `preflight` 会拦住 World：
+
+1. 装上游 web-access，把目录填进 `worlds.browser.skillDir`；
+2. 填 `worlds.browser.browser`（`chrome` / `edge` / `chromium`），并按下一节打开对应浏览器的远程调试开关。
+
+然后启用 `worlds.browser`，时间线应出现 `browser.ready`；Browser 详情页出现「搜索设置」与「B 站授权」面板。
+
+## 从源码构建
+
+1. `corepack pnpm install && corepack pnpm build:webui` —— 面板产物 `dist/webui.js` 必须先打出来；
+   `dist/` 不进包的 git，从仓库克隆后要自己 build（npm 包里已带好）；
+2. 装进部署，重启进程，再按上一节启用并填写配置。
+
 | 文件 | 内容 |
 |---|---|
 | `src/definition.ts` | `WorldDefinition`：id、label、默认配置段、`preflight` |
@@ -245,6 +280,12 @@ bot 想知道浏览活动时调一次 `browser_tabs`：回执给出此刻开着�
 必然的代价，写进工具说明了。
 
 （接了**她自己的实例**时这段没有对象：那个浏览器里只有她，所以变化段不报；`browser_tabs` 回的是
-她自己的页面。要保留"看他在干什么"，得另开一条只读的观察通道——见设计记录的「待定」。）
+她自己的页面。要保留"看他在干什么"，得另开一条只读的观察通道。）
 
-设计决定与理由见工作区的 `state/design/cortico-world-browser.md`。
+## 边界与代价
+
+- 搜索与正文抓取会消耗所选服务的额度；DeepSeek 与 Tavily 的 key 可选，网页引擎不需要 key。
+- `browser_js` 与点击是在**你的账号与登录态**上执行的真实动作；公开发布、下单、发消息都不可撤回。
+  本 World 不替 bot 判断这类语义，判断归 Persona。
+- 观看视频时投递的画面拼图会进入上下文，并按模型的附件规则每轮重发；长时间连看会让请求体变大。
+- 包只写自己的配置段与部署 `.env` 里的两个搜索密钥，不读写 Memory。
