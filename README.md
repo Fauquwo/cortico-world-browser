@@ -1,5 +1,9 @@
 # cortico-world-browser
 
+> **★ 非即插即用。** 装完包还不能用：先装上游 [web-access](https://github.com/eze-is/web-access)，
+> 把目录填进 `worlds.browser.skillDir`；再填 `worlds.browser.browser`，并打开那个浏览器的远程调试开关。
+> 缺一样 `preflight` 就会拦住 World，时间线里不会出现 `browser.ready`。步骤见下面「怎么装」。
+
 Owner: `src/definition.ts`
 
 把本机 [web-access](https://github.com/eze-is/web-access) 的 CDP proxy 接成一个 World：

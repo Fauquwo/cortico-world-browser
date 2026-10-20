@@ -95,13 +95,13 @@ export const BROWSER_CONFIG_GROUP: ConfigGroup = {
       'worlds.browser.skillDir': {
         type: 'string',
         title: 'web-access 目录',
-        description: '里面有 scripts/cdp-proxy.mjs，例如 C:\\tools\\web-access。必填。改完要重启这个 World 才生效。',
+        description: '里面有 scripts/cdp-proxy.mjs，例如 C:\\tools\\web-access。必填：没填或目录不对，这个 World 起不来。改完要重启这个 World 才生效。',
         'x-hot': false,
       },
       'worlds.browser.browser': {
         type: 'string',
         title: '浏览器',
-        description: 'chrome / edge / chromium。必须是你要操作的那一个。改完要重启这个 World 才生效。',
+        description: 'chrome / edge / chromium。必须是你要操作的那一个，而且已经打开它的远程调试开关；否则 proxy 连不上，World 起不来。改完要重启这个 World 才生效。',
         enum: ['chrome', 'edge', 'chromium'],
         'x-hot': false,
       },
