@@ -3,7 +3,7 @@
  * protobuf `DmSegMobileReply` bodies (field 1 repeated `DanmakuElem`: 1 id, 2 progress ms,
  * 3 mode, 7 content, 9 weight); subtitles as JSON `{ body: [{ from, to, content }] }` in seconds.
  */
-import { pbDecode, pbInt, pbText } from 'cortico/worlds/bilibili/protobuf.ts';
+import { pbDecode, pbInt, pbText } from './pb.ts';
 
 export interface Danmaku {
   id: string;

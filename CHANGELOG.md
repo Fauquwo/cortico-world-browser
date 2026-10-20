@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.3
+
+- 修一个会让整个 World 装不上的问题：弹幕解码原先直接 import 框架内建 B 站 World 里的
+  `cortico/worlds/bilibili/protobuf.ts`。有些宿主打包时会剪掉用不到的内建 World（Coopanion 删掉
+  `src/worlds/bilibili`），那个文件不存在，整个包导入即失败，控制台报 `Cannot find module …`。
+  现在把那段读取器连同许可证说明搬进包内 `src/video/pb.ts`，解码结果与原先逐字节一致。
+- 包内不再引用任何 `cortico/worlds/<内建世界>/` 路径。功能与配置无改动。
+
 ## 0.3.2
 
 - 市场卡片与 README 开头加「**非即插即用**」提示：装完包还需要先装上游 web-access、填
