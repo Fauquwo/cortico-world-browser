@@ -90,6 +90,8 @@ const authPanel: WebUiPanel = {
 };
 
 interface PlayerState {
+  autoBringToFront: boolean;
+  canPresent: boolean;
   mode: string;
   state: string;
   url: string;
@@ -114,21 +116,38 @@ const playerPanel: WebUiPanel = {
     const err = ui.msgline();
     const act = async (method: string) => {
       err.textContent = '';
-      const hold = ui.disable(openBtn, closeBtn);
+      const hold = ui.disable(openBtn, closeBtn, showBtn);
       try {
         const r = await ctx.invoke<{ message: string }>(method);
         ui.toast(r.message, 'ok');
-        await load();
       } catch (e) {
         err.textContent = String(e);
       } finally {
         hold.dispose();
+        void load().catch((e: unknown) => { err.textContent = String(e); });
       }
     };
     const openBtn = ui.button('打开 B 站页面', { variant: 'primary', onClick: () => void act('browser-open') });
     const closeBtn = ui.button('关闭 B 站页面', { variant: 'danger', onClick: () => void act('browser-close') });
-    bar.append(openBtn, closeBtn, ui.h('span', 'grow'));
-    card.body.append(bar);
+    const showBtn = ui.button('抬到桌面', { onClick: () => void act('browser-show') });
+    showBtn.disabled = true;
+    bar.append(openBtn, closeBtn, showBtn, ui.h('span', 'grow'));
+    const autoShow = ui.h('input');
+    autoShow.type = 'checkbox';
+    autoShow.disabled = true;
+    const autoLabel = ui.h('label');
+    autoLabel.append(autoShow, ' 看视频时自动抬到桌面');
+    let savingAuto = false;
+    autoShow.addEventListener('change', () => {
+      savingAuto = true;
+      autoShow.disabled = true;
+      err.textContent = '';
+      void ctx.setConfig('world:browser:video', { 'worlds.browser.video.autoBringToFront': autoShow.checked })
+        .then(() => { ui.toast('自动抬窗设置已保存，下次开始观看生效', 'ok'); })
+        .catch((e: unknown) => { err.textContent = String(e); })
+        .finally(() => { savingAuto = false; void load().catch((e: unknown) => { err.textContent = String(e); }); });
+    }, { signal: ctx.signal });
+    card.body.append(bar, autoLabel, ui.h('p', null, '自动抬窗默认关闭，仍受「允许她弹到你眼前」控制。关闭后仍可手动抬窗；这里的按钮由你直接操作，不受她的弹窗权限限制。抬窗需使用专属浏览器实例。'));
     const info = ui.h('div');
     const img = ui.h('img');
     img.alt = '最近一张观察帧';
@@ -150,6 +169,8 @@ const playerPanel: WebUiPanel = {
       if (ctx.signal.aborted) return;
       openBtn.disabled = s.mode !== 'idle';
       closeBtn.disabled = s.mode === 'idle';
+      showBtn.disabled = !s.canPresent || s.mode === 'idle';
+      if (!savingAuto) { autoShow.checked = s.autoBringToFront; autoShow.disabled = !s.canPresent; }
       info.replaceChildren(ui.kv([
         { k: '状态', v: ui.pill(MODE_TEXT[s.mode] ?? s.mode, s.mode === 'watching' ? 'on' : 'plain') },
         { k: '页面', v: s.url || '—' },

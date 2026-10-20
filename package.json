@@ -72,6 +72,7 @@
     "smoke": "tsx scripts/smoke.ts",
     "smoke:video": "tsx scripts/smoke-video.ts",
     "smoke:search-ui": "node scripts/smoke-search-ui.mjs",
+    "smoke:player-ui": "node scripts/smoke-player-ui.mjs",
     "build:webui": "node scripts/build-webui.mjs",
     "prepack": "node scripts/build-webui.mjs",
     "prepublishOnly": "npm run typecheck && npm run test"

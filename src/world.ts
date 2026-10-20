@@ -452,6 +452,12 @@ export class BrowserWorld implements World {
       cfg: cfg.video, timezone: opts.timezone,
       acquire: requested => this.acquireVideoPage(requested),
       touch: target => this.touch(target),
+      present: this.own ? async (target, by) => {
+        const outcome = await this.focus({ target }, by === 'operator');
+        if (typeof outcome === 'string') return outcome;
+        if (outcome.failed) throw new Error(outcome.text);
+        return outcome.text;
+      } : undefined,
       close: async target => {
         if (!this.mine.has(target)) throw new Error('这个页面不是 Browser 开的，请手动关闭；已经停止观看。');
         await this.relay.close(target, this.timeout());
@@ -983,7 +989,7 @@ export class BrowserWorld implements World {
    * "搬过去了"就等于"他看见了"（2026-10-01 之前就是这么栽的）。
    */
   private focusTool(): ToolDef {
-    return { ...BROWSER_FOCUS_TOOL, handler: async (args, ctx) => this.focus(args, ctx) };
+    return { ...BROWSER_FOCUS_TOOL, handler: async (args) => this.focus(args) };
   }
 
   private closeTool(): ToolDef {
@@ -1352,7 +1358,7 @@ export class BrowserWorld implements World {
     return { text: `已关闭 ${target}。` };
   }
 
-  private async focus(args: Record<string, unknown>, _ctx: ToolCallContext): Promise<ToolOutcome> {
+  private async focus(args: Record<string, unknown>, operator = false): Promise<ToolOutcome> {
     const target = str(args.target);
     if (!target) return fail('target 是空的：给 browser_open 或 browser_tabs 回的那个 target。');
     if (!this.own) {
@@ -1361,7 +1367,7 @@ export class BrowserWorld implements World {
           '要这个能力，得给她配一个她自己的浏览器实例（worlds.browser.ownBrowser）。',
       );
     }
-    if (!this.opts.cfg.bringToFront) {
+    if (!operator && !this.opts.cfg.bringToFront) {
       return fail('worlds.browser.bringToFront 关着：操作员不想被打断，页面留在屏幕外。');
     }
     const result = await this.show(target);

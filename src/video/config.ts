@@ -5,6 +5,8 @@ import type { ConfigGroup } from 'cortico/core/config-schema.ts';
 
 export interface VideoConfig {
   enabled: boolean;
+  /** Raise the video window once when a viewing session starts; manual display stays available. */
+  autoBringToFront: boolean;
   browser: { uposHost: string };
   playback: {
     /** Playback not advancing this long while not paused is reported as a stall. */
@@ -45,6 +47,7 @@ export interface VideoConfig {
 
 export const VIDEO_DEFAULTS: VideoConfig = {
   enabled: true,
+  autoBringToFront: false,
   browser: { uposHost: '' },
   playback: { stallSec: 6 },
   observe: {
@@ -74,6 +77,7 @@ export const VIDEO_CONFIG_GROUP: ConfigGroup = {
     title: 'B 站视频',
     properties: {
       [`${K}.enabled`]: { type: 'boolean', title: '启用 B 站视频模块', 'x-hot': false },
+      [`${K}.autoBringToFront`]: { type: 'boolean', title: '看视频时自动抬到桌面', description: '默认关闭。开始观看时抬起一次专属浏览器，仍受「允许她弹到你眼前」控制；关闭后仍可用 browser_focus 或播放面板手动展示。关闭不会把已展示的窗口藏回去。', 'x-hot': true },
       [`${K}.observe.minIntervalSec`]: { type: 'number', title: '观察间隔', minimum: 2, maximum: 120, 'x-suffix': 's', description: '两张观察帧之间最短的间隔;模型一轮更长时间隔跟着变长,格数按密度补上。', 'x-hot': true },
       [`${K}.observe.frameDensity`]: { type: 'number', title: '帧密度', minimum: 0.1, maximum: 2, 'x-suffix': '帧/s', description: '一张观察帧覆盖的时间里平均每秒取几帧;格数 = 间隔 × 密度,封顶在格数上限。', 'x-hot': true },
       [`${K}.observe.maxFrames`]: { type: 'integer', title: '格数上限', minimum: 1, maximum: 9, 'x-hot': true },

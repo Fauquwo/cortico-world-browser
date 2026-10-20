@@ -55,6 +55,8 @@ class Player {
 let session: BilibiliSession;
 let player: Player;
 let host: FakeHost;
+let cfg: typeof VIDEO_DEFAULTS;
+let present: ReturnType<typeof vi.fn>;
 
 async function call(name: string, args: Record<string,unknown> = {}) {
   const tool = session.tools().find(t=>t.name === 'browser_video_'+name)!;
@@ -73,8 +75,10 @@ async function watching() {
 beforeEach(async () => {
   vi.useFakeTimers();
   host = new FakeHost();
+  cfg = structuredClone(VIDEO_DEFAULTS);
+  present = vi.fn(async () => '窗口已展示');
   session = new BilibiliSession({
-    cfg:structuredClone(VIDEO_DEFAULTS),timezone:'Asia/Shanghai',
+    cfg,timezone:'Asia/Shanghai', present,
     acquire:async () => ({targetId:'video-1',browserURL:'http://127.0.0.1:1'}),
     touch:() => {},close:async () => {},
     createBrowser:opts => { player = new Player(opts); return player as unknown as VideoPage; },
@@ -84,6 +88,44 @@ beforeEach(async () => {
 afterEach(async () => { await session.stop(); vi.useRealTimers(); });
 
 describe('Browser Bilibili session', () => {
+  it('keeps automatic display off by default while manual display remains available', async () => {
+    await watching();
+    expect(present).not.toHaveBeenCalled();
+    expect(await panel('player', 'state')).toMatchObject({ autoBringToFront: false, canPresent: true });
+    expect(await panel('player', 'browser-show')).toMatchObject({ message: '窗口已展示' });
+    expect(present).toHaveBeenCalledWith('video-1', 'operator');
+    expect(host.events.some(e => e.text.includes('操作员手动展示'))).toBe(true);
+  });
+
+  it('automatically displays once on entering watching, reads hot changes, and preserves playback on failure', async () => {
+    cfg.autoBringToFront = true;
+    await watching();
+    expect(present).toHaveBeenCalledTimes(1);
+    expect(present).toHaveBeenCalledWith('video-1', 'bot');
+    await call('play');
+    expect(present).toHaveBeenCalledTimes(1);
+    await call('pause');
+    cfg.autoBringToFront = false;
+    await call('play');
+    expect(present).toHaveBeenCalledTimes(1);
+    await call('pause');
+    cfg.autoBringToFront = true;
+    present.mockRejectedValueOnce(new Error('操作员不想被打断'));
+    const result = await call('play');
+    expect(result.failed).not.toBe(true);
+    expect(result.text).toContain('自动抬窗未成功：操作员不想被打断');
+    expect(session.protects('video-1')).toBe(true);
+  });
+
+  it('does not raise on opening or after closing, and does not claim a missing window was shown', async () => {
+    cfg.autoBringToFront = true;
+    await call('open', { target: 'BV1234567890' });
+    expect(present).not.toHaveBeenCalled();
+    await panel('player', 'browser-close');
+    await expect(panel('player', 'browser-show')).rejects.toThrow('还没有视频页');
+    expect(present).not.toHaveBeenCalled();
+  });
+
   it('reuses the actual page identity and expires only the active viewing lease', async () => {
     await watching();
     expect(session.protects('video-1')).toBe(true);

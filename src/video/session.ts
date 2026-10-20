@@ -33,6 +33,8 @@ export interface BilibiliSessionOptions {
   acquire: VideoBrowserOptions['acquire'];
   touch: (targetId: string) => void;
   close: (targetId: string) => Promise<void>;
+  /** Supplied only when the host owns a browser window it can display safely. */
+  present?: (targetId: string, by: 'operator' | 'bot') => Promise<string>;
   createBrowser?: (opts: VideoBrowserOptions) => VideoPage;
 }
 
@@ -586,6 +588,7 @@ export class BilibiliSession {
   }
 
   private async play(args: Args): Promise<ToolOutcome> {
+    const wasWatching = this.mode === 'watching';
     if (!/\/video\//.test(this.browser.url())) throw new BrowserRefusal('当前窗口不是视频页;先 browser_video_open 打开一个视频');
     if (!this.video) await this.loadVideoPage();
     if (!this.video) throw new BrowserRefusal('当前页面还没有可读取的视频信息');
@@ -600,8 +603,22 @@ export class BilibiliSession {
     this.lastObservedT = pb?.t ?? from ?? 0;
     this.lastPlayback = pb;
     this.startObserving();
+    let presentation = '';
+    if (!wasWatching && this.cfg.autoBringToFront) {
+      try { presentation = await this.present('bot'); }
+      catch (err) { presentation = `视频继续播放；自动抬窗未成功：${(err as Error).message}`; }
+    }
     const o = this.cfg.observe;
-    return { text: `开始看${this.video ? `《${this.video.title}》` : ''},从 ${fmt(pb?.t ?? from ?? 0)} 起,画面 ${pb?.width ?? '?'}×${pb?.height ?? '?'}。之后每隔约 ${o.minIntervalSec} 秒自动收到一条观察帧。` };
+    return { text: `开始看${this.video ? `《${this.video.title}》` : ''},从 ${fmt(pb?.t ?? from ?? 0)} 起,画面 ${pb?.width ?? '?'}×${pb?.height ?? '?'}。之后每隔约 ${o.minIntervalSec} 秒自动收到一条观察帧。${presentation ? `\n${presentation}` : ''}` };
+  }
+
+  private async present(by: 'operator' | 'bot'): Promise<string> {
+    if (!this.opts.present) throw new BrowserRefusal('抬窗需要启用她自己的浏览器实例（worlds.browser.ownBrowser）');
+    const target = this.targetId;
+    if (!target) throw new BrowserRefusal('还没有视频页，请先打开 B 站页面');
+    const message = await this.opts.present(target, by);
+    if (by === 'operator') this.pushState(`[视频] 操作员手动展示了视频窗口。${message}`);
+    return message;
   }
 
   private async pauseTool(): Promise<ToolOutcome> {
@@ -780,7 +797,7 @@ export class BilibiliSession {
     }
     if (panel === 'player') {
       if (method === 'state') {
-        return { mode: this.mode, state: this.stateLine(), url: this.browser.url(), video: this.video ? { title: this.video.title, owner: this.video.owner, duration: this.video.duration, bvid: this.video.bvid } : null, playback: this.lastPlayback, samples: this.samples.length, danmaku: this.danmaku.size, subtitle: this.subtitleLabel || null, scenes: this.sceneCount, lastMontageAt: this.lastMontage?.at ?? null, lastMontageCells: this.lastMontage?.cells ?? 0 };
+        return { autoBringToFront: this.cfg.autoBringToFront ?? false, canPresent: !!this.opts.present, mode: this.mode, state: this.stateLine(), url: this.browser.url(), video: this.video ? { title: this.video.title, owner: this.video.owner, duration: this.video.duration, bvid: this.video.bvid } : null, playback: this.lastPlayback, samples: this.samples.length, danmaku: this.danmaku.size, subtitle: this.subtitleLabel || null, scenes: this.sceneCount, lastMontageAt: this.lastMontage?.at ?? null, lastMontageCells: this.lastMontage?.cells ?? 0 };
       }
       if (method === 'montage') {
         if (!this.lastMontage) throw new Error('还没有观察帧');
@@ -788,6 +805,7 @@ export class BilibiliSession {
       }
       if (method === 'browser-open') return this.exclusive(async () => ({message: await this.openBrowser('operator')}));
       if (method === 'browser-close') return this.exclusive(async () => ({message: await this.closeBrowser('operator')}));
+      if (method === 'browser-show') return this.exclusive(async () => ({message: await this.present('operator')}));
     }
     throw new Error(`未知方法 ${panel}/${method}`);
   }

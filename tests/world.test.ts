@@ -1022,6 +1022,23 @@ describe('她自己的浏览器实例', () => {
     expect(proxy.hits).toContain('/new');
   });
 
+  it('视频自动展示遵守弹窗权限，操作员手动展示可在关掉权限后使用', async () => {
+    const proxy = await fakeProxy();
+    const cdp = await fakeBrowserCdp();
+    proxy.chromePort = cdp.port;
+    const world = startedWorld(proxy.port, { ...ownPatch(cdp.port), bringToFront: false });
+    await world.start(new FakeHost());
+    const internals = world as unknown as {
+      show: (target: string) => Promise<unknown>;
+      video: { opts: { present: (target: string, by: 'operator' | 'bot') => Promise<string> } };
+    };
+    const show = vi.spyOn(internals, 'show').mockResolvedValue({ visibility: 'visible', raise: { ok: false, reason: 'fixture' } });
+    await expect(internals.video.opts.present('T1', 'bot')).rejects.toThrow('不想被打断');
+    expect(show).not.toHaveBeenCalled();
+    expect(await internals.video.opts.present('T1', 'operator')).toContain('已把 T1 搬到操作员眼前');
+    expect(show).toHaveBeenCalledWith('T1');
+  });
+
   it('开页不再自动弹到他眼前：专属实例下 open 不碰窗口位置/激活', async () => {
     const proxy = await fakeProxy();
     const cdp = await fakeBrowserCdp();
