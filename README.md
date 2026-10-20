@@ -19,6 +19,24 @@ bot 能在浏览器里搜索、开页、读页、点击、填表、上传、滚�
   她要打断他时才用 `browser_focus` 把某个页面搬到他眼前。代价是登录态不共享，要用的站点得在这个
   profile 里登一次。
 
+## 在 Coopanion(Coo)上使用
+
+已在 **Coopanion 0.2.5**(Windows x64 便携版)上装机验收:市场里检查与安装成功,重启后**导入成功**;
+搜索面板与 B 站播放面板都能打开,设置页显示搜索配置;专属 Chrome 与 cdp-proxy 在线;
+六个工具在真实浏览器上依次走通(打开、输入、点击、读回、看标签、关闭),读回了本地测试页里提交的内容;
+真模型也跑过一轮(模型自己 `browser_open` 读页面 → 用别的工具干活 → `browser_close`)。
+这一次没有测 B 站扫码登录与视频播放,也没测 DeepSeek / Tavily 这类付费搜索 API(要账号与密钥)。
+「非即插即用」那一条在 Coo 上同样成立:web-access、`skillDir`、浏览器远程调试三样都要自己配,
+Coopanion 不会代劳。
+
+Coo 的扩展市场默认可能走镜像源(npmmirror),镜像上偶尔还没有新版本 —— 检查时报「registry 没有给出
+cortico-world-browser 的 x.y.z 版本」,就把 Coo 的扩展源改成官方 `https://registry.npmjs.org` 再装。
+装完或改过配置要**整进程重启** Coo 才生效(只重启 World 不够,端口与 profile 会按旧值走)。
+
+**遇到问题**:去 GitHub 开 issue —— https://github.com/biliye/cortico-world-browser/issues;
+或者到 QQ 群里 @筆離嘢(和作者名同名)。附上 Coo 版本、本包版本和报错截图,再说清是「连不上 proxy」
+「浏览器没连上」还是「页面没打开」那一类 —— 回执里会写明,照着贴就行。
+
 ## 市场标签
 
 按官方索引仓的 [TAGS.md](https://github.com/Pal-AI-Lab/cortico-extensions/blob/main/TAGS.md) 声明了五个标签：
