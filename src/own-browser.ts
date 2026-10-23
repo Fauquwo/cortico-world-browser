@@ -2,25 +2,20 @@
  * 她自己的浏览器实例。
  *
  * 2026-10-01 起可选：不再借操作员日常那个浏览器，而是给她一个独立 profile、独立调试端口的
- * Chrome。理由当场量过：上游 `/new` 建的是**后台 tab**，而后台 tab 里**媒体根本加载不起来**
- * ——页面调了 `play()`，`readyState` 一直是 0、`currentTime` 不动（同步读 DOM 与定时器却都正常），
- * 闲置几分钟后整个 tab 还被冻结。启动参数治不了这一条（试过 `--autoplay-policy=...`）：只有把
- * tab 调到前台它才立刻 `readyState: 4` 播起来。有了专属实例，"调到前台"就只是把她自己的窗口
- * 带上来，不会抢操作员正在用的那个窗口。
+ * Chrome。理由当场量过：借来的浏览器里 `/new` 建的是**后台 tab**，而后台 tab 里**媒体根本加载
+ * 不起来**——页面调了 `play()`，`readyState` 一直是 0、`currentTime` 不动（同步读 DOM 与定时器
+ * 却都正常），闲置几分钟后整个 tab 还被冻结。启动参数治不了这一条（试过
+ * `--autoplay-policy=...`）：只有把 tab 调到前台它才立刻 `readyState: 4` 播起来。有了专属实例，
+ * "调到前台"就只是把她自己的窗口带上来，不会抢操作员正在用的那个窗口。
  *
  * 这个文件做三件事：
- *   1. 起停那个实例（探活 → 复用 → 才 spawn），并给它写上游发现用的 `DevToolsActivePort`；
- *   2. 直接对它说几句 CDP：建窗口、`Target.activateTarget`、搬窗口——上游 13 个端点里没有这些口；
+ *   1. 起停那个实例（探活 → 复用 → 才 spawn）；引擎（`cdp-engine.ts`）按配置里的端口直连它；
+ *   2. 直接对它说几句 CDP：建窗口、`Target.activateTarget`、搬窗口——通用工具面里没有这些口；
  *   3. "搬到他眼前"的最后一步（抬 z 序）交给 `window-raise.ts`：CDP 改不了 z 序，那件事只有
  *      操作系统做得了。2026-10-01 量到的坑就在这：窗口搬回来了，却还压在他正用的程序底下。
- *
- * 为什么 discovery 文件要我们自己写：现代 Chrome 用 `--remote-debugging-port` 启动时**不写**
- * `DevToolsActivePort`（只有 `chrome://inspect` 那个开关写），而上游正是读这个文件找浏览器。
- * 我们把它写在自己的"家"目录里（配合 World 拉起 proxy 时重定向的 `LOCALAPPDATA`），
- * 上游据此认出来的就是她这个实例——**他日常那个 Edge 一点不用动**。
  */
 import { spawn, type ChildProcess } from 'node:child_process';
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Logger } from 'cortico/core/types.ts';
 import { raiseBrowserWindow, type RaiseResult } from './window-raise.ts';
@@ -46,17 +41,11 @@ export interface OwnBrowserOptions {
 /**
  * profile 目录：**照 Chrome 自己的布局**放（`<home>/Google/Chrome/User Data`）。
  *
- * 这样上游的 `browser-discovery` 在 `LOCALAPPDATA` 被重定向到 `<home>` 之后，按
- * `path.join(localAppData, 'Google/Chrome/User Data/DevToolsActivePort')` 找的就是它，
- * 不需要改上游一行。
+ * 为什么照抄布局：这是 Chrome 生态里各路工具（包括本包的书签历史检索）默认会找的位置，
+ * 放在这儿就不需要任何额外的"指路"配置。
  */
 export function chromeProfileDir(home: string): string {
   return join(home, 'Google', 'Chrome', 'User Data');
-}
-
-/** 上游读的那个发现文件。 */
-export function devToolsActivePortFile(home: string): string {
-  return join(chromeProfileDir(home), 'DevToolsActivePort');
 }
 
 /**
@@ -102,7 +91,6 @@ export function ownBrowserArgs(opts: OwnBrowserOptions): string[] {
 
 interface VersionInfo {
   wsUrl: string;
-  wsPath: string;
 }
 
 /** 从浏览器自己的 HTTP 口读 `/json/version`。 */
@@ -113,7 +101,7 @@ async function readVersion(cdpPort: number, timeoutMs: number): Promise<VersionI
     const body = (await res.json()) as { webSocketDebuggerUrl?: unknown };
     const wsUrl = typeof body.webSocketDebuggerUrl === 'string' ? body.webSocketDebuggerUrl : '';
     if (!wsUrl) return null;
-    return { wsUrl, wsPath: new URL(wsUrl).pathname };
+    return { wsUrl };
   } catch {
     return null;
   }
@@ -145,16 +133,14 @@ export class OwnBrowser {
   }
 
   /**
-   * 保证实例可用：先探活（活着就复用，顺手把发现文件刷新成它现在的 ws 路径——每次启动那串
-   * UUID 都不一样），探不到才拉起，起来后等它就绪，最后写发现文件。
+   * 保证实例可用：先探活（活着就复用），探不到才拉起，起来后等它就绪。
    *
    * 返回 `null` 表示好了；否则是给人看的原因。不抛错：起不来要让工具去报失败，而不是这个
-   * World 整个消失（与 proxy 那一套一致）。
+   * World 整个消失（与引擎那一路一致）。
    */
   async ensure(log: Logger, timeoutMs: number): Promise<string | null> {
     const existing = await this.probe();
     if (existing) {
-      this.writeDiscovery(existing);
       log.info('复用已在运行的她的浏览器', { endpoint: this.cdpEndpoint(), ws: existing.wsUrl });
       await this.parkWindows(log);
       return null;
@@ -198,7 +184,6 @@ export class OwnBrowser {
     while (Date.now() < deadline) {
       const info = await readVersion(this.opts.cdpPort, PROBE_TIMEOUT_MS);
       if (info) {
-        this.writeDiscovery(info);
         await this.parkWindows(log);
         return null;
       }
@@ -222,18 +207,6 @@ export class OwnBrowser {
     } catch (err) {
       // 挪不动不是致命错：她的窗口仍然能用，只是可能浮在他屏幕上。日志留一句就够。
       log.warn?.('挪窗口没成', { error: err instanceof Error ? err.message : String(err) });
-    }
-  }
-
-  /** 把发现文件写成它现在的样子。上游据此认出这个实例。 */
-  private writeDiscovery(info: VersionInfo): void {
-    try {
-      const file = devToolsActivePortFile(this.opts.home);
-      mkdirSync(chromeProfileDir(this.opts.home), { recursive: true });
-      writeFileSync(file, `${this.opts.cdpPort}\n${info.wsPath}\n`, 'utf8');
-    } catch (err) {
-      // 写不了不致命：探活那条路（`/json/version`）仍然是通的，只是上游可能认不出它。
-      this.lastError = `写不了 ${devToolsActivePortFile(this.opts.home)}：${describe(err)}`;
     }
   }
 

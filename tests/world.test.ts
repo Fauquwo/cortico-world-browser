@@ -1,217 +1,103 @@
 import { VIDEO_TOOL_DECLS } from '../src/video/tools.ts';
 import { BilibiliSession } from '../src/video/session.ts';
-import { createServer, type Server } from 'node:http';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import type { AddressInfo } from 'node:net';
+import { createServer } from 'node:http';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createRequire } from 'node:module';
+import type { AddressInfo } from 'node:net';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ToolCallContext, ToolOutcome } from 'cortico/core/types.ts';
 import { dryMountWorld, fakeWorldContext } from 'cortico/extensions/dry-mount.ts';
-import { RelayError, classifyRelayError } from '../src/cdp-client.ts';
+import { EngineError, classifyEngineError } from '../src/cdp-engine.ts';
 import type { BrowserConfigSection } from '../src/config.ts';
 import { BROWSER } from '../src/definition.ts';
-import { OwnBrowser, chromeProfileDir, devToolsActivePortFile, ownBrowserArgs } from '../src/own-browser.ts';
+import { OwnBrowser, chromeProfileDir, ownBrowserArgs } from '../src/own-browser.ts';
+import { findUrl } from '../src/find-url.ts';
 import type { BrowserWorld } from '../src/world.ts';
 import { FakeHost } from './helpers/fake-host.ts';
+import { fakeBrowser, listenForHttp, type FakeBrowser } from './helpers/fake-browser.ts';
 
 let scratchDir: string;
-let servers: Server[] = [];
 let worlds: BrowserWorld[] = [];
+let fakes: FakeBrowser[] = [];
 
-/** Windows may allocate an ephemeral port that fetch refuses before opening a socket. */
-async function listenForHttp(server: Server): Promise<void> {
-  for (;;) {
-    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
-    const port = (server.address() as AddressInfo).port;
-    if (port >= 1024 && ![2049,3659,4045,5060,5061,6000,6566,10080].includes(port) && !(port >= 6665 && port <= 6699)) return;
-    await new Promise<void>(resolve => server.close(() => resolve()));
-  }
+/** 造一个假浏览器并登记进 afterEach 的清理名单。 */
+async function makeFake(): Promise<FakeBrowser> {
+  const fake = await fakeBrowser();
+  fakes.push(fake);
+  return fake;
 }
+
+/** 空出来的端口：让「起不来」那条路有个确定没人在听的地方。 */
+async function freePort(): Promise<number> {
+  const server = createServer();
+  await listenForHttp(server);
+  const port = (server.address() as AddressInfo).port;
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+  return port;
+}
+
+const nodeRequire = createRequire(import.meta.url);
 
 beforeEach(() => {
   scratchDir = mkdtempSync(join(tmpdir(), 'browser-world-'));
-  servers = [];
   worlds = [];
+  fakes = [];
 });
 
 afterEach(async () => {
   for (const world of worlds) await world.stop().catch(() => {});
-  for (const server of servers) await new Promise<void>((resolve) => server.close(() => resolve()));
+  for (const fake of fakes) await fake.close().catch(() => {});
+  vi.unstubAllEnvs();
   rmSync(scratchDir, { recursive: true, force: true });
 });
 
-// ——— 假的 cdp-proxy：真的 HTTP 服务，行为可按用例改 ———
+// ——— 假的浏览器调试口：真的会说 CDP 的服务（helpers/fake-browser.ts），行为可按用例改 ———
 
-interface FakeProxy {
-  port: number;
-  /** 浏览器里此刻开着的页面。 */
-  pages: Array<{ targetId: string; url: string; title: string }>;
-  /** `/eval` 回什么（按我们那层包装的形状：{ ok, value } 或 { ok: false, error }）。 */
-  evalReply: (expression: string) => unknown;
-  /** 设了就让 `/eval` 以这个状态码回 `{ error: 'Uncaught' }`。 */
-  evalStatus: number | null;
-  /** proxy 在跑但浏览器没连上。 */
-  browserDown: boolean;
-  /** `/health` 里报的"实际连着的 CDP 端口"。给 0 表示不报这一项。 */
-  chromePort: number;
-  /** `/new` 收到的正文（我们只该发 `about:blank`：建 tab 与导航是两步）。 */
-  openBodies: string[];
-  /** `/navigate` 收到的地址。 */
-  navBodies: string[];
-  /** 设了就让 `/navigate` 先拖这么久——用来验导航那一段用的是更宽的超时。 */
-  navDelayMs: number;
-  /** 设了就让 `/navigate` 回这个状态码 + `CDP 命令超时: Page.navigate`（站点打不开的现场）。 */
-  navStatus: number | null;
-  /** 设了就让 `/click` 或 `/clickAt` 顺手开出一张新页面（`target=_blank` 链接的现场）。 */
-  clickOpens: { url: string; title: string } | null;
-  evalBodies: string[];
-  hits: string[];
-  closed: string[];
-}
-
-async function fakeProxy(): Promise<FakeProxy> {
-  let seq = 0;
-  const state: FakeProxy = {
-    port: 0,
-    pages: [],
-    evalReply: () => ({ ok: true, value: null }),
-    evalStatus: null,
-    browserDown: false,
-    chromePort: 0,
-    openBodies: [],
-    navBodies: [],
-    navDelayMs: 0,
-    navStatus: null,
-    clickOpens: null,
-    evalBodies: [],
-    hits: [],
-    closed: [],
-  };
-  const server = createServer((req, res) => {
-    const url = new URL(req.url ?? '/', 'http://127.0.0.1');
-    const path = url.pathname;
-    state.hits.push(path);
-    const body = (): Promise<string> =>
-      new Promise((resolve) => {
-        let text = '';
-        req.on('data', (chunk: Buffer) => {
-          text += String(chunk);
-        });
-        req.on('end', () => resolve(text));
-      });
-    const json = (value: unknown, status = 200): void => {
-      res.writeHead(status, { 'content-type': 'application/json' });
-      res.end(JSON.stringify(value));
-    };
-    void (async () => {
-      if (path === '/health') {
-        json({
-          status: 'ok',
-          connected: !state.browserDown,
-          browser: { id: 'chrome', label: 'Chrome', source: 'preference' },
-          managedTabs: state.pages.length,
-          chromePort: state.chromePort,
-        });
-        return;
-      }
-      if (state.browserDown) {
-        json({ error: 'Chrome 未开启远程调试端口' }, 500);
-        return;
-      }
-      if (path === '/targets') {
-        json(state.pages.map((page) => ({ ...page, type: 'page' })));
-        return;
-      }
-      if (path === '/new') {
-        const target = (await body()).trim();
-        state.openBodies.push(target);
-        seq += 1;
-        const targetId = `T${seq}`;
-        state.pages.push({ targetId, url: target, title: `页面${seq}` });
-        json({ targetId });
-        return;
-      }
-      if (path === '/info') {
-        const page = state.pages.find((item) => item.targetId === url.searchParams.get('target'));
-        json({ title: page?.title ?? '', url: page?.url ?? '', ready: 'complete' });
-        return;
-      }
-      if (path === '/eval') {
-        const sent = await body();
-        state.evalBodies.push(sent);
-        if (state.evalStatus !== null) {
-          json({ error: 'Uncaught' }, state.evalStatus);
-          return;
-        }
-        json({ value: state.evalReply(sent) });
-        return;
-      }
-      if (path === '/click' || path === '/clickAt') {
-        if (state.clickOpens) {
-          seq += 1;
-          state.pages.push({ targetId: `T${seq}`, url: state.clickOpens.url, title: state.clickOpens.title });
-        }
-        json({ clicked: true, tag: 'button', text: '提交' });
-        return;
-      }
-      if (path === '/setFiles') {
-        const parsed = JSON.parse(await body()) as { files?: unknown[] };
-        json({ success: true, files: parsed.files?.length ?? 0 });
-        return;
-      }
-      if (path === '/scroll') {
-        json({ value: `scrolled ${url.searchParams.get('direction') ?? 'down'}` });
-        return;
-      }
-      if (path === '/screenshot') {
-        res.writeHead(200, { 'content-type': 'image/png' });
-        res.end(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
-        return;
-      }
-      if (path === '/navigate') {
-        const to = (await body()).trim();
-        state.navBodies.push(to);
-        if (state.navDelayMs > 0) await sleep(state.navDelayMs);
-        if (state.navStatus !== null) {
-          // 上游在宿主不回话时的原话：Page.navigate 等满它自己的 30 秒 CDP 超时。
-          json({ error: 'CDP 命令超时: Page.navigate' }, state.navStatus);
-          return;
-        }
-        const page = state.pages.find((item) => item.targetId === url.searchParams.get('target'));
-        if (page) page.url = to;
-        json({ frameId: 'frame-1' });
-        return;
-      }
-      if (path === '/back') {
-        json({ ok: true });
-        return;
-      }
-      if (path === '/close') {
-        const target = String(url.searchParams.get('target'));
-        state.closed.push(target);
-        state.pages = state.pages.filter((item) => item.targetId !== target);
-        json({ success: true });
-        return;
-      }
-      json({ error: `未知端点 ${path}` }, 404);
-    })();
-  });
-  servers.push(server);
-  await listenForHttp(server);
-  state.port = (server.address() as AddressInfo).port;
-  return state;
-}
-
-/** 一个指向假 proxy 的部署上下文。 */
-function contextAt(port: number, patch: Partial<BrowserConfigSection> = {}) {
+/**
+ * 借操作员浏览器模式：把「他的 Chrome」指到 scratch 里的假浏览器——
+ * 发现文件写在 `LOCALAPPDATA` 指向的目录下（发现逻辑读的就是那里），端口指向假浏览器。
+ */
+async function borrowedWorld(
+  fake: FakeBrowser | null,
+  patch: Partial<BrowserConfigSection> = {},
+  { withDiscoveryFile = fake !== null } = {},
+): Promise<BrowserWorld> {
+  vi.stubEnv('LOCALAPPDATA', scratchDir);
+  if (withDiscoveryFile && fake) {
+    const userDir = join(scratchDir, 'Google', 'Chrome', 'User Data');
+    mkdirSync(userDir, { recursive: true });
+    writeFileSync(join(userDir, 'DevToolsActivePort'), `${fake.port}\n/devtools/browser/FAKE-UUID\n`);
+  }
   const ctx = fakeWorldContext(BROWSER, { scratchDir });
-  ctx.persist({ browser: 'chrome', port, ...patch });
-  return ctx;
+  ctx.persist({ browser: 'chrome', ...patch });
+  const world = BROWSER.create(ctx) as BrowserWorld;
+  worlds.push(world);
+  return world;
 }
 
-function startedWorld(port: number, patch: Partial<BrowserConfigSection> = {}): BrowserWorld {
-  const world = BROWSER.create(contextAt(port, patch)) as BrowserWorld;
+/** 专属实例模式：引擎直连假浏览器的端口，不经过发现。 */
+function ownWorld(fake: FakeBrowser, patch: Partial<BrowserConfigSection> = {}): BrowserWorld {
+  const ctx = fakeWorldContext(BROWSER, { scratchDir });
+  ctx.persist({
+    browser: 'chrome',
+    ownBrowser: true,
+    ownBrowserExe: writeFakeExe(scratchDir),
+    ownBrowserHome: join(scratchDir, 'home'),
+    ownBrowserPort: fake.port,
+    ...patch,
+  });
+  const world = BROWSER.create(ctx) as BrowserWorld;
+  worlds.push(world);
+  return world;
+}
+
+/** 不起引擎的裸 World：工具表、提示词变量、preflight、拒绝路径用。 */
+function bareWorld(patch: Partial<BrowserConfigSection> = {}): BrowserWorld {
+  const ctx = fakeWorldContext(BROWSER, { scratchDir });
+  ctx.persist({ browser: 'chrome', ...patch });
+  const world = BROWSER.create(ctx) as BrowserWorld;
   worlds.push(world);
   return world;
 }
@@ -225,15 +111,6 @@ async function call(world: BrowserWorld, name: string, args: Record<string, unkn
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
-/** 空出来的端口：让「自己拉起」那条路有个确定的地方去听。 */
-async function freePort(): Promise<number> {
-  const server = createServer();
-  await listenForHttp(server);
-  const port = (server.address() as AddressInfo).port;
-  await new Promise<void>((resolve) => server.close(() => resolve()));
-  return port;
-}
-
 /**
  * 一个"存在就行"的可执行文件：preflight 只检查它存不存在，不会真去跑它。
  * （真拉起浏览器那一段由实机冒烟覆盖，见设计记录。）
@@ -242,52 +119,6 @@ function writeFakeExe(dir: string): string {
   const file = join(dir, 'chrome.exe');
   writeFileSync(file, 'not a real browser');
   return file;
-}
-
-/**
- * 假的"浏览器自己的调试口"：只回 `/json/version`，也就是我们探活与拿 ws 地址用的那一个口。
- * 它的 `webSocketDebuggerUrl` 指向它自己——那不是一个真的 WebSocket 服务，所以"调前台"
- * 会在这里失败，正好用来验失败那条路。
- */
-async function fakeBrowserCdp(): Promise<{ port: number; wsUrl: string }> {
-  const server = createServer((req, res) => {
-    if ((req.url ?? '').startsWith('/json/version')) {
-      const port = (server.address() as AddressInfo).port;
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/browser/FAKE-UUID` }));
-      return;
-    }
-    res.writeHead(404, { 'content-type': 'application/json' });
-    res.end('{}');
-  });
-  servers.push(server);
-  await listenForHttp(server);
-  const port = (server.address() as AddressInfo).port;
-  return { port, wsUrl: `ws://127.0.0.1:${port}/devtools/browser/FAKE-UUID` };
-}
-
-/** 一个最小的、真的是这个协议的 proxy：给自己拉起那条路当靶子。 */
-function writeProxyScript(dir: string): void {  mkdirSync(join(dir, 'scripts'), { recursive: true });
-  writeFileSync(
-    join(dir, 'scripts', 'cdp-proxy.mjs'),
-    [
-      "import http from 'node:http';",
-      "const port = Number(process.env.CDP_PROXY_PORT || 3456);",
-      'const server = http.createServer((req, res) => {',
-      "  const path = new URL(req.url, 'http://127.0.0.1').pathname;",
-      "  if (path === '/health' || path === '/targets') {",
-      "    res.writeHead(200, { 'content-type': 'application/json' });",
-      "    res.end(path === '/health'",
-      "      ? JSON.stringify({ status: 'ok', connected: true, browser: { id: 'chrome', label: 'Chrome' }, managedTabs: 0 })",
-      "      : '[]');",
-      '    return;',
-      '  }',
-      "  res.writeHead(404, { 'content-type': 'application/json' });",
-      "  res.end('{\"error\":\"未知端点\"}');",
-      '});',
-      "server.listen(port, '127.0.0.1');",
-    ].join('\n'),
-  );
 }
 
 const PAGE_DUMP = {
@@ -309,8 +140,7 @@ describe('Browser World', () => {
   });
 
   it('通用与视频工具都带 browser_ 前缀和非空标签', () => {
-    const world = startedWorld(3456);
-    const tools = world.tools();
+    const tools = bareWorld().tools();
     expect(tools.map((tool) => tool.name)).toEqual([
       'browser_open',
       'browser_search',
@@ -337,71 +167,46 @@ describe('Browser World', () => {
   });
 
   it('环境提示词报占位符值：借他日常那个浏览器时，是"后台 tab"那一种', () => {
-    const world = startedWorld(3456, { browser: 'edge' });
-    const vars = world.envPromptVars();
+    const vars = bareWorld({ browser: 'edge' }).envPromptVars();
     expect(vars['browser.label']).toBe('Edge');
     expect(vars['browser.kind']).toContain('操作员日常');
     expect(vars['browser.front']).toContain('后台 tab');
   });
 
   it('环境提示词：她自己的实例说成"窗口停在屏幕外、媒体照样能播"', () => {
-    const world = startedWorld(3456, { browser: 'chrome', ownBrowser: true, ownBrowserPort: 9223 });
-    const vars = world.envPromptVars();
+    const vars = bareWorld({ ownBrowser: true, ownBrowserPort: 9223 }).envPromptVars();
     expect(vars['browser.kind']).toContain('专属实例');
     expect(vars['browser.front']).toContain('屏幕外');
     expect(vars['browser.front']).toContain('媒体');
   });
 
-  it('没有子进程时 stop() 是空操作', async () => {
-    const world = startedWorld(3456);
-    await expect(world.stop()).resolves.toBeUndefined();
+  it('没连过浏览器时 stop() 是空操作', async () => {
+    await expect(bareWorld().stop()).resolves.toBeUndefined();
   });
 
   describe('激活前检查', () => {
-    it('skillDir 没配时说清楚要填什么', () => {
-      const ctx = fakeWorldContext(BROWSER, { scratchDir });
-      expect(() => BROWSER.preflight!(ctx)).toThrow(/skillDir 没配/);
-    });
-
-    it('目录不存在时指出那个目录', () => {
-      const ctx = fakeWorldContext(BROWSER, { scratchDir });
-      ctx.persist({ skillDir: join(scratchDir, '没有这个目录'), browser: 'chrome' });
-      expect(() => BROWSER.preflight!(ctx)).toThrow(/不存在/);
-    });
-
-    it('目录里没有 cdp-proxy.mjs 时点名它', () => {
-      const ctx = fakeWorldContext(BROWSER, { scratchDir });
-      ctx.persist({ skillDir: scratchDir, browser: 'chrome' });
-      expect(() => BROWSER.preflight!(ctx)).toThrow(/cdp-proxy\.mjs/);
-    });
-
     it('browser 没配或写了别的名字时都拦下', () => {
-      writeProxyScript(scratchDir);
       const bare = fakeWorldContext(BROWSER, { scratchDir });
-      bare.persist({ skillDir: scratchDir });
       expect(() => BROWSER.preflight!(bare)).toThrow(/browser 没配/);
 
       const wrong = fakeWorldContext(BROWSER, { scratchDir });
-      wrong.persist({ skillDir: scratchDir, browser: 'firefox' });
+      wrong.persist({ browser: 'firefox' });
       expect(() => BROWSER.preflight!(wrong)).toThrow(/chrome \/ edge \/ chromium/);
     });
 
-    it('配齐了就通过', () => {
-      writeProxyScript(scratchDir);
+    it('配齐了就通过（包里不再需要任何外部目录）', () => {
       const ctx = fakeWorldContext(BROWSER, { scratchDir });
-      ctx.persist({ skillDir: scratchDir, browser: 'chrome' });
+      ctx.persist({ browser: 'chrome' });
       expect(() => BROWSER.preflight!(ctx)).not.toThrow();
     });
 
     it('开了专属实例但没填程序/目录时，逐条点名', () => {
-      writeProxyScript(scratchDir);
       const noExe = fakeWorldContext(BROWSER, { scratchDir });
-      noExe.persist({ skillDir: scratchDir, browser: 'chrome', ownBrowser: true });
+      noExe.persist({ browser: 'chrome', ownBrowser: true });
       expect(() => BROWSER.preflight!(noExe)).toThrow(/ownBrowserExe 没配/);
 
       const missingExe = fakeWorldContext(BROWSER, { scratchDir });
       missingExe.persist({
-        skillDir: scratchDir,
         browser: 'chrome',
         ownBrowser: true,
         ownBrowserExe: join(scratchDir, '没有这个.exe'),
@@ -410,7 +215,6 @@ describe('Browser World', () => {
 
       const noHome = fakeWorldContext(BROWSER, { scratchDir });
       noHome.persist({
-        skillDir: scratchDir,
         browser: 'chrome',
         ownBrowser: true,
         ownBrowserExe: writeFakeExe(scratchDir),
@@ -419,10 +223,8 @@ describe('Browser World', () => {
     });
 
     it('专属实例只认 chrome：指了别的浏览器就拦下', () => {
-      writeProxyScript(scratchDir);
       const ctx = fakeWorldContext(BROWSER, { scratchDir });
       ctx.persist({
-        skillDir: scratchDir,
         browser: 'edge',
         ownBrowser: true,
         ownBrowserExe: writeFakeExe(scratchDir),
@@ -433,40 +235,34 @@ describe('Browser World', () => {
   });
 
   describe('起停', () => {
-    it('已在运行的 proxy 被复用，投一条 internal 的就绪事件，stop 不关它', async () => {
-      const proxy = await fakeProxy();
-      const world = startedWorld(proxy.port, { skillDir: scratchDir });
+    it('连上浏览器后投一条 internal 的就绪事件', async () => {
+      const fake = await makeFake();
+      const world = await borrowedWorld(fake);
       const host = new FakeHost();
       await world.start(host);
 
       expect(host.events.map((event) => event.type)).toEqual(['browser.ready']);
       expect(host.events[0].origin).toBe('internal');
       expect(host.events[0].source).toBe('browser');
-
-      await world.stop();
-      const res = await fetch(`http://127.0.0.1:${proxy.port}/health`);
-      expect(res.ok).toBe(true);
+      expect(host.events[0].text).toContain('调试口');
     });
 
-    it('端口上没有 proxy 时自己拉起，stop 之后关掉自己拉起的那个', async () => {
-      const port = await freePort();
-      writeProxyScript(scratchDir);
-      const world = startedWorld(port, { skillDir: scratchDir, readyTimeoutMs: 8000 });
+    it('专属实例由本 World 起停：stop() 只断自己的连接，不杀她的实例', async () => {
+      const fake = await makeFake();
+      const world = ownWorld(fake);
       const host = new FakeHost();
       await world.start(host);
-
       expect(host.events.map((event) => event.type)).toEqual(['browser.ready']);
-      const alive = await fetch(`http://127.0.0.1:${port}/health`);
-      expect(alive.ok).toBe(true);
 
       await world.stop();
-      await expect(fetch(`http://127.0.0.1:${port}/health`)).rejects.toThrow();
+      const res = await fetch(`http://127.0.0.1:${fake.port}/json/version`);
+      expect(res.ok).toBe(true); // 她的浏览器还活着
     });
 
-    it('proxy 在跑但浏览器没连上：投 browser.down，不抛错', async () => {
-      const proxy = await fakeProxy();
-      proxy.browserDown = true;
-      const world = startedWorld(proxy.port, { skillDir: scratchDir });
+    it('调试口活着但 WebSocket 连不上：投 browser.down，不抛错', async () => {
+      const fake = await makeFake();
+      fake.controls.wsDead = true;
+      const world = await borrowedWorld(fake, { readyTimeoutMs: 3000 });
       const host = new FakeHost();
       await world.start(host);
 
@@ -475,41 +271,33 @@ describe('Browser World', () => {
       expect(host.events[0].text).toContain('inspect');
     });
 
-    it('端口被别的程序占着时先说清原因，不去拉一个抢端口的', async () => {
-      const busy = createServer((_req, res) => {
-        res.writeHead(404);
-        res.end();
-      });
-      servers.push(busy);
-      await new Promise<void>((resolve) => busy.listen(0, '127.0.0.1', resolve));
-      const port = (busy.address() as AddressInfo).port;
-
-      writeProxyScript(scratchDir);
-      const world = startedWorld(port, { skillDir: scratchDir, readyTimeoutMs: 1500 });
+    it('HTTP 发现端点不应答时，改用发现文件里的 ws 路径直连（新式开关只留 WebSocket 的形状）', async () => {
+      const fake = await makeFake();
+      fake.controls.versionEndpointDead = true;
+      const world = await borrowedWorld(fake);
       const host = new FakeHost();
       await world.start(host);
 
-      expect(host.events.map((event) => event.type)).toEqual(['browser.down']);
-      expect(host.events[0].text).toContain('端口');
-      expect(host.events[0].text).toContain('别的程序');
+      expect(host.events.map((event) => event.type)).toEqual(['browser.ready']);
+      expect(host.events[0].text).toContain('调试口');
     });
 
-    it('拉起来的东西立刻死掉时也投 browser.down，不抛错', async () => {
-      const port = await freePort();
-      mkdirSync(join(scratchDir, 'scripts'), { recursive: true });
-      const world = startedWorld(port, { skillDir: scratchDir, readyTimeoutMs: 1500 });
+    it('远程调试开关没开（没有发现文件）：当场说清去开哪个开关', async () => {
+      const world = await borrowedWorld(null, {}, { withDiscoveryFile: false });
       const host = new FakeHost();
       await world.start(host);
 
       expect(host.events.map((event) => event.type)).toEqual(['browser.down']);
+      expect(host.events[0].text).toContain('远程调试');
+      expect(host.events[0].text).toContain('inspect');
     });
   });
 
   describe('工具', () => {
     it('browser_open：回 target、标题、正文与链接，表达式里带上了读页那段', async () => {
-      const proxy = await fakeProxy();
-      proxy.evalReply = () => PAGE_DUMP;
-      const world = startedWorld(proxy.port, { skillDir: scratchDir });
+      const fake = await makeFake();
+      fake.controls.evalReply = () => PAGE_DUMP;
+      const world = await borrowedWorld(fake);
       await world.start(new FakeHost());
 
       const out = await call(world, 'browser_open', { url: 'example.com/a' });
@@ -518,31 +306,33 @@ describe('Browser World', () => {
       expect(out.text).toContain('甲页面');
       expect(out.text).toContain('这是一段正文。');
       expect(out.text).toContain('https://example.com/more');
-      expect(proxy.evalBodies.at(-1)).toContain('shadowRoot');
-      expect(proxy.pages[0].url).toBe('https://example.com/a');
+      expect(fake.controls.evalBodies.at(-1)).toContain('shadowRoot');
+      expect(fake.controls.pages[0].url).toBe('https://example.com/a');
+      // attach 之后防探测的口子是装上的：页面摸调试口会被拒（0.4.0 起这一条由引擎自己管）。
+      expect(fake.controls.guards).toBeGreaterThan(0);
     });
 
     it('browser_open 分两步：先建空白 tab 认出 id，再单独导航', async () => {
-      const proxy = await fakeProxy();
-      proxy.evalReply = () => PAGE_DUMP;
-      const world = startedWorld(proxy.port, { skillDir: scratchDir });
+      const fake = await makeFake();
+      fake.controls.evalReply = () => PAGE_DUMP;
+      const world = await borrowedWorld(fake);
       await world.start(new FakeHost());
 
       const out = await call(world, 'browser_open', { url: 'example.com/a' });
       expect(out.failed).toBeUndefined();
-      // 建 tab 那一步只发 about:blank，地址走 /navigate：两步才认得住 id，孤儿就是这么来的。
-      expect(proxy.openBodies).toEqual(['about:blank']);
-      expect(proxy.navBodies).toEqual(['https://example.com/a']);
+      // 建页那一步只发 about:blank，地址走导航：两步才认得住 id，孤儿就是这么来的。
+      expect(fake.controls.createBodies).toEqual(['about:blank']);
+      expect(fake.controls.navBodies).toEqual(['https://example.com/a']);
       // 认下来了：她关得掉（失败那一路也认，见下一条）。
       const closed = await call(world, 'browser_close', { target: 'T1' });
       expect(closed.failed).toBeUndefined();
       expect(closed.text).toContain('已关闭');
     });
 
-    it('站点打不开（上游 CDP 命令超时）：说清哪一类、不贴开关那句，tab 留着且关得掉', async () => {
-      const proxy = await fakeProxy();
-      proxy.navStatus = 500;
-      const world = startedWorld(proxy.port, { skillDir: scratchDir });
+    it('站点打不开（CDP 命令超时）：说清哪一类、不贴开关那句，tab 留着且关得掉', async () => {
+      const fake = await makeFake();
+      fake.controls.navError = 'CDP 命令超时: Page.navigate';
+      const world = await borrowedWorld(fake);
       await world.start(new FakeHost());
 
       const out = await call(world, 'browser_open', { url: 'example.com' });
@@ -558,10 +348,10 @@ describe('Browser World', () => {
     });
 
     it('导航那一段用的是更宽的超时：比 requestTimeoutMs 慢的导航仍然成', async () => {
-      const proxy = await fakeProxy();
-      proxy.evalReply = () => PAGE_DUMP;
-      proxy.navDelayMs = 3500; // 普通调用超时是 3000 的下限，导航那一段是 35 秒
-      const world = startedWorld(proxy.port, { skillDir: scratchDir, requestTimeoutMs: 3000 });
+      const fake = await makeFake();
+      fake.controls.evalReply = () => PAGE_DUMP;
+      fake.controls.navDelayMs = 3500; // 普通调用超时是 3000 的下限，导航那一段是 35 秒
+      const world = await borrowedWorld(fake, { requestTimeoutMs: 3000 });
       await world.start(new FakeHost());
 
       const out = await call(world, 'browser_open', { url: 'example.com/slow' });
@@ -570,117 +360,125 @@ describe('Browser World', () => {
     }, 15000);
 
     it('browser_read：选择器与字数上限透传进去，正文空时提示去截图', async () => {
-      const proxy = await fakeProxy();
-      proxy.pages = [{ targetId: 'T1', url: 'https://example.com/a', title: '甲' }];
-      proxy.evalReply = () => ({ ...PAGE_DUMP, value: { ...PAGE_DUMP.value, text: '', links: [] } });
-      const world = startedWorld(proxy.port, { skillDir: scratchDir });
+      const fake = await makeFake();
+      fake.controls.pages = [{ targetId: 'X1', url: 'https://example.com/a', title: '甲' }];
+      fake.controls.evalReply = () => ({ ...PAGE_DUMP, value: { ...PAGE_DUMP.value, text: '', links: [] } });
+      const world = await borrowedWorld(fake);
       await world.start(new FakeHost());
 
-      const out = await call(world, 'browser_read', { target: 'T1', selector: 'main article', maxChars: 2000 });
+      const out = await call(world, 'browser_read', { target: 'X1', selector: 'main article', maxChars: 2000 });
       expect(out.text).toContain('正文是空的');
-      expect(proxy.evalBodies.at(-1)).toContain('main article');
-      expect(proxy.evalBodies.at(-1)).toContain('2000');
+      expect(fake.controls.evalBodies.at(-1)).toContain('main article');
+      expect(fake.controls.evalBodies.at(-1)).toContain('2000');
     });
 
     it('browser_read：选择器不存在时回失败，并点名那个选择器', async () => {
-      const proxy = await fakeProxy();
-      proxy.evalReply = () => ({ ok: true, value: { ...PAGE_DUMP.value, error: '这个选择器在页面上找不到: #没有' } });
-      const world = startedWorld(proxy.port, { skillDir: scratchDir });
+      const fake = await makeFake();
+      fake.controls.pages = [{ targetId: 'X1', url: 'https://example.com/a', title: '甲' }];
+      fake.controls.evalReply = () => ({ ok: true, value: { ...PAGE_DUMP.value, error: '这个选择器在页面上找不到: #没有' } });
+      const world = await borrowedWorld(fake);
       await world.start(new FakeHost());
 
-      const out = await call(world, 'browser_read', { target: 'T1', selector: '#没有' });
+      const out = await call(world, 'browser_read', { target: 'X1', selector: '#没有' });
       expect(out.failed).toBe(true);
       expect(out.text).toContain('#没有');
     });
 
     it('browser_js：值渲染出来；页面抛错时回失败', async () => {
-      const proxy = await fakeProxy();
-      proxy.evalReply = () => ({ ok: true, value: 42 });
-      const world = startedWorld(proxy.port, { skillDir: scratchDir });
+      const fake = await makeFake();
+      fake.controls.pages = [{ targetId: 'X1', url: 'https://example.com/a', title: '甲' }];
+      fake.controls.evalReply = () => ({ ok: true, value: 42 });
+      const world = await borrowedWorld(fake);
       await world.start(new FakeHost());
 
-      const ok = await call(world, 'browser_js', { target: 'T1', expression: '21 * 2' });
+      const ok = await call(world, 'browser_js', { target: 'X1', expression: '21 * 2' });
       expect(ok.text).toContain('42');
-      expect(proxy.evalBodies.at(-1)).toContain('21 * 2');
-      expect(proxy.evalBodies.at(-1)).toContain('try {');
+      expect(fake.controls.evalBodies.at(-1)).toContain('21 * 2');
+      expect(fake.controls.evalBodies.at(-1)).toContain('try {');
 
-      proxy.evalReply = () => ({ ok: false, error: 'TypeError: 某某 is not a function' });
-      const bad = await call(world, 'browser_js', { target: 'T1', expression: '某某()' });
+      fake.controls.evalReply = () => ({ ok: false, error: 'TypeError: 某某 is not a function' });
+      const bad = await call(world, 'browser_js', { target: 'X1', expression: '某某()' });
       expect(bad.failed).toBe(true);
       expect(bad.text).toContain('TypeError');
     });
 
     it('browser_js：语法错误时告诉模型这里只收表达式', async () => {
-      const proxy = await fakeProxy();
-      proxy.evalStatus = 400;
-      const world = startedWorld(proxy.port, { skillDir: scratchDir });
+      const fake = await makeFake();
+      fake.controls.pages = [{ targetId: 'X1', url: 'https://example.com/a', title: '甲' }];
+      fake.controls.evalExceptionText = 'Uncaught';
+      const world = await borrowedWorld(fake);
       await world.start(new FakeHost());
 
-      const out = await call(world, 'browser_js', { target: 'T1', expression: 'const a = 1; a' });
+      const out = await call(world, 'browser_js', { target: 'X1', expression: 'const a = 1; a' });
       expect(out.failed).toBe(true);
       expect(out.text).toContain('只收表达式');
     });
 
     it('browser_click：默认 JS 点击，native 走真实鼠标那条路', async () => {
-      const proxy = await fakeProxy();
-      const world = startedWorld(proxy.port, { skillDir: scratchDir });
+      const fake = await makeFake();
+      fake.controls.pages = [{ targetId: 'X1', url: 'https://example.com/a', title: '甲' }];
+      const world = await borrowedWorld(fake);
       await world.start(new FakeHost());
 
-      const plain = await call(world, 'browser_click', { target: 'T1', selector: 'button.submit' });
+      const plain = await call(world, 'browser_click', { target: 'X1', selector: 'button.submit' });
       expect(plain.text).toContain('已点击');
-      expect(proxy.hits).toContain('/click');
+      expect(fake.controls.clicks).toContain('js');
 
-      const native = await call(world, 'browser_click', { target: 'T1', selector: 'button.upload', native: true });
+      const native = await call(world, 'browser_click', { target: 'X1', selector: 'button.upload', native: true });
       expect(native.text).toContain('真实鼠标');
-      expect(proxy.hits).toContain('/clickAt');
+      expect(fake.controls.dispatches).toBe(2); // mousePressed + mouseReleased
     });
 
     it('browser_type：填进去之后回执带当前值与提交方式；选项不存在时回失败', async () => {
-      const proxy = await fakeProxy();
-      proxy.evalReply = () => ({ ok: true, value: { ok: true, applied: 'value', value: '北京时间', submitted: 'form' } });
-      const world = startedWorld(proxy.port, { skillDir: scratchDir });
+      const fake = await makeFake();
+      fake.controls.pages = [{ targetId: 'X1', url: 'https://example.com/a', title: '甲' }];
+      fake.controls.evalReply = () => ({ ok: true, value: { ok: true, applied: 'value', value: '北京时间', submitted: 'form' } });
+      const world = await borrowedWorld(fake);
       await world.start(new FakeHost());
 
-      const out = await call(world, 'browser_type', { target: 'T1', selector: 'input', value: '北京时间', submit: true });
+      const out = await call(world, 'browser_type', { target: 'X1', selector: 'input', value: '北京时间', submit: true });
       expect(out.text).toContain('北京时间');
       expect(out.text).toContain('已提交');
-      expect(proxy.evalBodies.at(-1)).toContain('requestSubmit');
+      expect(fake.controls.evalBodies.at(-1)).toContain('requestSubmit');
 
-      proxy.evalReply = () => ({ ok: true, value: { ok: false, error: '这个 select 里没有这个选项: 乙' } });
-      const bad = await call(world, 'browser_type', { target: 'T1', selector: 'select', value: '乙' });
+      fake.controls.evalReply = () => ({ ok: true, value: { ok: false, error: '这个 select 里没有这个选项: 乙' } });
+      const bad = await call(world, 'browser_type', { target: 'X1', selector: 'select', value: '乙' });
       expect(bad.failed).toBe(true);
       expect(bad.text).toContain('没有这个选项');
     });
 
     it('browser_upload：报挂上了几个文件', async () => {
-      const proxy = await fakeProxy();
-      const world = startedWorld(proxy.port, { skillDir: scratchDir });
+      const fake = await makeFake();
+      fake.controls.pages = [{ targetId: 'X1', url: 'https://example.com/a', title: '甲' }];
+      const world = await borrowedWorld(fake);
       await world.start(new FakeHost());
 
       const out = await call(world, 'browser_upload', {
-        target: 'T1',
+        target: 'X1',
         selector: 'input[type=file]',
         files: ['C:\\work\\a.png', 'C:\\work\\b.png'],
       });
       expect(out.text).toContain('2 个文件');
+      expect(fake.controls.uploads.at(-1)?.count).toBe(2);
     });
 
     it('browser_scroll：把方向透传过去', async () => {
-      const proxy = await fakeProxy();
-      const world = startedWorld(proxy.port, { skillDir: scratchDir });
+      const fake = await makeFake();
+      fake.controls.pages = [{ targetId: 'X1', url: 'https://example.com/a', title: '甲' }];
+      const world = await borrowedWorld(fake);
       await world.start(new FakeHost());
 
-      const out = await call(world, 'browser_scroll', { target: 'T1', to: 'bottom' });
+      const out = await call(world, 'browser_scroll', { target: 'X1', to: 'bottom' });
       expect(out.text).toContain('bottom');
     });
 
     it('browser_shot：回执挂上 PNG 附件', async () => {
-      const proxy = await fakeProxy();
-      proxy.pages = [{ targetId: 'T1', url: 'https://example.com/a', title: '甲' }];
-      const world = startedWorld(proxy.port, { skillDir: scratchDir });
+      const fake = await makeFake();
+      fake.controls.pages = [{ targetId: 'X1', url: 'https://example.com/a', title: '甲' }];
+      const world = await borrowedWorld(fake);
       await world.start(new FakeHost());
 
-      const out = await call(world, 'browser_shot', { target: 'T1' });
+      const out = await call(world, 'browser_shot', { target: 'X1' });
       const blob = out.blobs?.[0] as { mime: string; bytes: Uint8Array } | undefined;
       expect(out.blobs).toHaveLength(1);
       expect(blob?.mime).toBe('image/png');
@@ -689,24 +487,24 @@ describe('Browser World', () => {
     });
 
     it('browser_navigate：url 补协议，back 走后一条路', async () => {
-      const proxy = await fakeProxy();
-      proxy.pages = [{ targetId: 'T1', url: 'https://example.com/a', title: '甲' }];
-      const world = startedWorld(proxy.port, { skillDir: scratchDir });
+      const fake = await makeFake();
+      fake.controls.pages = [{ targetId: 'X1', url: 'https://example.com/a', title: '甲' }];
+      const world = await borrowedWorld(fake);
       await world.start(new FakeHost());
 
-      const moved = await call(world, 'browser_navigate', { target: 'T1', url: 'example.com/b' });
+      const moved = await call(world, 'browser_navigate', { target: 'X1', url: 'example.com/b' });
       expect(moved.text).toContain('已导航');
-      expect(proxy.hits).toContain('/navigate');
+      expect(fake.controls.navBodies).toContain('https://example.com/b');
 
-      const back = await call(world, 'browser_navigate', { target: 'T1', back: true });
+      const back = await call(world, 'browser_navigate', { target: 'X1', back: true });
       expect(back.text).toContain('已后退');
-      expect(proxy.hits).toContain('/back');
+      expect(fake.controls.backs).toBe(1);
     });
 
     it('browser_tabs：标注哪些是她自己开的', async () => {
-      const proxy = await fakeProxy();
-      proxy.pages = [{ targetId: 'HIS', url: 'https://example.com/his', title: '他开的' }];
-      const world = startedWorld(proxy.port, { skillDir: scratchDir });
+      const fake = await makeFake();
+      fake.controls.pages = [{ targetId: 'HIS', url: 'https://example.com/his', title: '他开的' }];
+      const world = await borrowedWorld(fake);
       await world.start(new FakeHost());
 
       await call(world, 'browser_open', { url: 'example.com/mine' });
@@ -717,60 +515,36 @@ describe('Browser World', () => {
     });
 
     it('browser_close：只关自己开的，别人的拒绝并说明', async () => {
-      const proxy = await fakeProxy();
-      proxy.pages = [{ targetId: 'HIS', url: 'https://example.com/his', title: '他开的' }];
-      const world = startedWorld(proxy.port, { skillDir: scratchDir });
+      const fake = await makeFake();
+      fake.controls.pages = [{ targetId: 'HIS', url: 'https://example.com/his', title: '他开的' }];
+      const world = await borrowedWorld(fake);
       await world.start(new FakeHost());
 
       const refused = await call(world, 'browser_close', { target: 'HIS' });
       expect(refused.failed).toBe(true);
       expect(refused.text).toContain('不是我开的');
-      expect(proxy.closed).toEqual([]);
+      expect(fake.controls.closed).toEqual([]);
 
       await call(world, 'browser_open', { url: 'example.com/mine' });
-      const mineTarget = proxy.pages.at(-1)!.targetId;
+      const mineTarget = fake.controls.pages.at(-1)!.targetId;
       const closed = await call(world, 'browser_close', { target: mineTarget });
       expect(closed.text).toContain('已关闭');
-      expect(proxy.closed).toEqual([mineTarget]);
+      expect(fake.controls.closed).toEqual([mineTarget]);
     });
 
-    it('browser_find_url：原样透传那个脚本的输出；skillDir 没配时直接失败', async () => {
-      const proxy = await fakeProxy();
-      const dir = join(scratchDir, 'web-access');
-      mkdirSync(join(dir, 'scripts'), { recursive: true });
-      writeFileSync(
-        join(dir, 'scripts', 'find-url.mjs'),
-        [
-          "const argv = process.argv.slice(2);",
-          "if (argv.includes('找不到')) { console.error('没有找到浏览器数据目录'); process.exit(1); }",
-          "console.log('[历史] 1 条（按最近访问）');",
-          "console.log('  内部系统 | https://intra.example.com/dash | 2026-09-18 10:00:00 | visits=3');",
-        ].join('\n'),
-      );
-      const world = startedWorld(proxy.port, { skillDir: dir });
+    it('browser_find_url：包内检索本机的书签与历史', async () => {
+      const fake = await makeFake();
+      const world = await borrowedWorld(fake);
+      writeFindUrlFixture(scratchDir);
       await world.start(new FakeHost());
 
       const out = await call(world, 'browser_find_url', { keywords: ['内部系统'], only: 'history' });
       expect(out.text).toContain('[历史] 1 条');
       expect(out.text).toContain('intra.example.com');
-
-      const bad = await call(world, 'browser_find_url', { keywords: ['找不到'] });
-      expect(bad.failed).toBe(true);
-      expect(bad.text).toContain('没有找到浏览器数据目录');
-
-      const missing = await call(startedWorld(proxy.port), 'browser_find_url', { keywords: ['x'] });
-      expect(missing.failed).toBe(true);
-      expect(missing.text).toContain('skillDir');
-
-      const noScript = await call(startedWorld(proxy.port, { skillDir: scratchDir }), 'browser_find_url', {
-        keywords: ['x'],
-      });
-      expect(noScript.failed).toBe(true);
-      expect(noScript.text).toContain('find-url.mjs');
     });
 
     it('浏览器不可用时工具回失败，并指出要去开哪个开关', async () => {
-      const world = startedWorld(9); // 9 端口上不会有东西
+      const world = await borrowedWorld(null, {}, { withDiscoveryFile: false });
       const out = await call(world, 'browser_tabs');
       expect(out.failed).toBe(true);
       expect(out.text).toContain('浏览器不可用');
@@ -780,12 +554,12 @@ describe('Browser World', () => {
 
   describe('他此刻在干什么（拉取式：她问才看）', () => {
     it('第一回看只列页面，没有变化段', async () => {
-      const proxy = await fakeProxy();
-      proxy.pages = [
+      const fake = await makeFake();
+      fake.controls.pages = [
         { targetId: 'HIS1', url: 'https://example.com/a', title: '甲' },
         { targetId: 'HIS2', url: 'https://github.com/x', title: '拉取请求' },
       ];
-      const world = startedWorld(proxy.port, { skillDir: scratchDir });
+      const world = await borrowedWorld(fake);
       await world.start(new FakeHost());
 
       const out = await call(world, 'browser_tabs');
@@ -795,44 +569,48 @@ describe('Browser World', () => {
     });
 
     it('他开了、转了、关掉之后，第二回看带出净变化', async () => {
-      const proxy = await fakeProxy();
-      proxy.pages = [
+      const fake = await makeFake();
+      fake.controls.pages = [
         { targetId: 'HIS1', url: 'https://example.com/a', title: '甲' },
         { targetId: 'HIS2', url: 'https://example.com/b', title: '乙' },
       ];
-      const world = startedWorld(proxy.port, { skillDir: scratchDir });
+      const world = await borrowedWorld(fake);
       await world.start(new FakeHost());
-      await call(world, 'browser_tabs');
+      const baseline = await call(world, 'browser_tabs');
+      expect(baseline.failed, `baseline=${baseline.text}`).toBeFalsy(); // 基线这回必须成：变化段的口径靠它打底
+      expect(baseline.text).toContain('- 乙');
 
       // 他：把甲那页转到别的地址，把乙关掉，又新开一页。
-      proxy.pages = [
+      fake.controls.pages = [
         { targetId: 'HIS1', url: 'https://example.com/a2', title: '甲改' },
         { targetId: 'HIS3', url: 'https://bilibili.com/v/x', title: '视频' },
       ];
       const out = await call(world, 'browser_tabs');
-      expect(out.text).toContain('[变化] 距你上次看');
+      // 措辞不钉死：两次查看挨得太近（同一毫秒）时是「自你上次看」，隔开了才是「距你上次看约…」。
+      expect(out.text).toMatch(/\[变化\] (距你上次看约|自你上次看)/);
+      expect(out.text).toContain('转到 example.com「甲改」');
       expect(out.text).toContain('转到 example.com「甲改」');
       expect(out.text).toContain('打开 bilibili.com「视频」');
       expect(out.text).toContain('关掉 example.com「乙」');
     });
 
     it('中间那一段没在采样：变化是两次查看之间的净变化', async () => {
-      const proxy = await fakeProxy();
-      const world = startedWorld(proxy.port, { skillDir: scratchDir });
+      const fake = await makeFake();
+      const world = await borrowedWorld(fake);
       await world.start(new FakeHost());
       await call(world, 'browser_tabs');
 
       // 他开了一个又关掉，全程夹在两次查看之间。
-      proxy.pages = [{ targetId: 'TMP', url: 'https://example.com/tmp', title: '一闪而过' }];
+      fake.controls.pages = [{ targetId: 'TMP', url: 'https://example.com/tmp', title: '一闪而过' }];
       await call(world, 'browser_tabs'); // 这一回会报「打开」
-      proxy.pages = [];
+      fake.controls.pages = [];
       const out = await call(world, 'browser_tabs');
       expect(out.text).toContain('关掉 example.com「一闪而过」');
     });
 
     it('她自己开的页面不算他的变化', async () => {
-      const proxy = await fakeProxy();
-      const world = startedWorld(proxy.port, { skillDir: scratchDir });
+      const fake = await makeFake();
+      const world = await borrowedWorld(fake);
       await world.start(new FakeHost());
       await call(world, 'browser_tabs');
 
@@ -843,21 +621,21 @@ describe('Browser World', () => {
     });
 
     it('浏览器的内部页面只在列表里，不进变化段', async () => {
-      const proxy = await fakeProxy();
-      const world = startedWorld(proxy.port, { skillDir: scratchDir });
+      const fake = await makeFake();
+      const world = await borrowedWorld(fake);
       await world.start(new FakeHost());
       await call(world, 'browser_tabs');
 
-      proxy.pages = [{ targetId: 'NEWTAB', url: 'chrome://newtab/', title: '新标签页' }];
+      fake.controls.pages = [{ targetId: 'NEWTAB', url: 'chrome://newtab/', title: '新标签页' }];
       const out = await call(world, 'browser_tabs');
       expect(out.text).toContain('新标签页');
       expect(out.text).not.toContain('[变化]');
     });
 
     it('重启后的第一回看只打底，不把已经开着的页面当成他的变化', async () => {
-      const proxy = await fakeProxy();
-      proxy.pages = [{ targetId: 'HIS1', url: 'https://example.com/a', title: '甲' }];
-      const world = startedWorld(proxy.port, { skillDir: scratchDir });
+      const fake = await makeFake();
+      fake.controls.pages = [{ targetId: 'HIS1', url: 'https://example.com/a', title: '甲' }];
+      const world = await borrowedWorld(fake);
       await world.start(new FakeHost());
       await call(world, 'browser_tabs');
       await world.stop();
@@ -871,37 +649,27 @@ describe('Browser World', () => {
 });
 
 describe('失败归类（决定回执贴哪句话）', () => {
-  it('认得出四类：命令没回话、连不上 proxy、浏览器没连上、proxy 报的其他错', () => {
-    expect(classifyRelayError(new RelayError('CDP 命令超时: Page.navigate', 500))).toBe('command-timeout');
-    expect(classifyRelayError(new RelayError('连不上 cdp-proxy（http://127.0.0.1:3517）：The operation was aborted due to timeout', 0))).toBe('unreachable');
-    expect(classifyRelayError(new RelayError('Chrome 未开启远程调试端口', 500))).toBe('not-connected');
-    expect(classifyRelayError(new RelayError('WebSocket 未连接', 500))).toBe('not-connected');
-    expect(classifyRelayError(new RelayError('未知端点 /x', 404))).toBe('relay');
+  it('认得出四类：命令没回话、连不上浏览器、浏览器没连上、页面已经不在了', () => {
+    expect(classifyEngineError(new EngineError('CDP 命令超时: Page.navigate', 500))).toBe('command-timeout');
+    expect(classifyEngineError(new EngineError('连不上浏览器：The operation was aborted due to timeout', 0))).toBe('unreachable');
+    expect(classifyEngineError(new EngineError('WebSocket 未连接（浏览器没连上或刚断开）', 500))).toBe('not-connected');
+    expect(classifyEngineError(new EngineError('attach 失败: {"code":-32001}', 500))).toBe('not-connected');
+    // 目标没了是日常操作（页面被关掉/回收了），不算连接问题，不贴「去开开关」。
+    expect(classifyEngineError(new EngineError('页面不存在或已关闭（target T9）。用 browser_tabs 看一眼现在还有哪些页面。', 500))).toBe('relay');
+    expect(classifyEngineError(new EngineError('未找到元素: #x', 400))).toBe('relay');
   });
 });
 
 /**
  * 她自己的浏览器实例（2026-10-01 加）。
  *
- * 这一组钉的是**决策与 HTTP 那半**：启动参数齐不齐、发现文件写到哪儿、实例已在跑时复用、
+ * 这一组钉的是**决策与起停那半**：启动参数齐不齐、实例已在跑时复用、直连的是她那个端口、
  * 以及"开页之后确实去调了前台"。
  *
  * 真拉起一个浏览器、以及裸 WebSocket 上的 `Target.activateTarget` 本身，单测不覆盖——
  * 那两段由 `pnpm smoke` 对着真的 Chrome 跑（见设计记录「验证」一节）。
  */
 describe('她自己的浏览器实例', () => {
-  /** 一份"配齐了"的专属实例配置，指向用例自己起的假浏览器口。 */
-  function ownPatch(cdpPort: number): Partial<BrowserConfigSection> {
-    return {
-      skillDir: scratchDir,
-      browser: 'chrome',
-      ownBrowser: true,
-      ownBrowserExe: writeFakeExe(scratchDir),
-      ownBrowserHome: join(scratchDir, 'home'),
-      ownBrowserPort: cdpPort,
-    };
-  }
-
   it('启动参数：屏幕外 + 让"页面能活"的那几条都在（谁删掉谁负责）', () => {
     const args = ownBrowserArgs({ exePath: 'chrome.exe', home: 'H', cdpPort: 9223 });
     expect(args).toContain(`--user-data-dir=${chromeProfileDir('H')}`);
@@ -915,68 +683,47 @@ describe('她自己的浏览器实例', () => {
     expect(args).toContain('--no-first-run');
   });
 
-  it('发现文件的位置：照 Chrome 自己的布局放在她的"家"里', () => {
+  it('profile 的位置：照 Chrome 自己的布局放在她的"家"里', () => {
     expect(chromeProfileDir('H')).toBe(join('H', 'Google', 'Chrome', 'User Data'));
-    expect(devToolsActivePortFile('H')).toBe(join('H', 'Google', 'Chrome', 'User Data', 'DevToolsActivePort'));
   });
 
-  it('实例已经在跑时：复用它（不 spawn），并把发现文件刷新成它现在的端口与 ws 路径', async () => {
-    const cdp = await fakeBrowserCdp();
-    const home = join(scratchDir, 'home');
-    const own = new OwnBrowser({ exePath: writeFakeExe(scratchDir), home, cdpPort: cdp.port });
+  it('实例已经在跑时：复用它（不 spawn）', async () => {
+    const fake = await makeFake();
+    const own = new OwnBrowser({ exePath: writeFakeExe(scratchDir), home: join(scratchDir, 'home'), cdpPort: fake.port });
 
     expect(await own.ensure(new FakeHost().log, 3000)).toBeNull();
     expect(own.owned).toBe(false); // 复用来的，不该被当成"自己拉起的"
-
-    const lines = readFileSync(devToolsActivePortFile(home), 'utf8').split('\n').filter((line) => line !== '');
-    expect(lines[0]).toBe(String(cdp.port));
-    expect(lines[1]).toBe('/devtools/browser/FAKE-UUID');
   });
 
   it('探不到实例、程序又不在时，把原因说清楚（不抛错）', async () => {
-    const free = await freePort();
+    const idle = await freePort();
     const own = new OwnBrowser({
       exePath: join(scratchDir, '没有这个.exe'),
       home: join(scratchDir, 'home'),
-      cdpPort: free,
+      cdpPort: idle,
     });
     const problem = await own.ensure(new FakeHost().log, 1500);
     expect(problem).toContain('不存在');
   });
 
-  it('proxy 连的不是她那个实例：当场说清，不静默去动别人的浏览器', async () => {
-    const proxy = await fakeProxy();
-    const cdp = await fakeBrowserCdp();
-    proxy.chromePort = 9222; // 假 proxy 说它连的是别处
-    const world = startedWorld(proxy.port, ownPatch(cdp.port));
-    const host = new FakeHost();
-    await world.start(host);
-
-    expect(host.events.map((event) => event.type)).toEqual(['browser.down']);
-    expect(host.events[0].text).toContain('不是她自己的那个');
-  });
-
-  it('那个连错浏览器的旧 proxy 一直活着时，后续工具调用也不接管它', async () => {
-    const proxy = await fakeProxy();
-    const cdp = await fakeBrowserCdp();
-    proxy.chromePort = 9222;
-    const world = startedWorld(proxy.port, ownPatch(cdp.port));
+  it('专属模式直连她那个端口：他的浏览器一页都不被碰', async () => {
+    const hers = await makeFake();
+    hers.controls.evalReply = () => PAGE_DUMP;
+    const his = await makeFake();
+    his.controls.pages = [{ targetId: 'HIS-1', url: 'https://example.com/his', title: '他的页' }];
+    const world = ownWorld(hers);
     await world.start(new FakeHost());
 
-    // 它是活的，`/targets` 答得出来——只探活不看连的是谁，就会把页面开到他浏览器里去。
-    const before = proxy.hits.length;
     const out = await call(world, 'browser_open', { url: 'example.com/a' });
-    expect(out.failed).toBe(true);
-    expect(out.text).toContain('不是她自己的那个');
-    expect(proxy.hits.slice(before)).not.toContain('/new');
+    expect(out.failed).toBeFalsy();
+    expect(hers.controls.pages.some((page) => page.url === 'https://example.com/a')).toBe(true);
+    expect(his.controls.pages.map((page) => page.targetId)).toEqual(['HIS-1']);
   });
 
   it('专属实例里 browser_tabs 说"你自己的浏览器"，也不报变化段', async () => {
-    const proxy = await fakeProxy();
-    const cdp = await fakeBrowserCdp();
-    proxy.chromePort = cdp.port;
-    proxy.pages.push({ targetId: 'T9', url: 'https://example.com/', title: '甲' });
-    const world = startedWorld(proxy.port, ownPatch(cdp.port));
+    const fake = await makeFake();
+    fake.controls.pages.push({ targetId: 'T9', url: 'https://example.com/', title: '甲' });
+    const world = ownWorld(fake);
     await world.start(new FakeHost());
 
     const out = await call(world, 'browser_tabs');
@@ -985,33 +732,25 @@ describe('她自己的浏览器实例', () => {
   });
 
   it('借他日常那个浏览器时，browser_focus 拒绝并说清为什么', async () => {
-    const proxy = await fakeProxy();
-    const world = startedWorld(proxy.port, { skillDir: scratchDir });
-    await world.start(new FakeHost());
-
+    const world = bareWorld();
     const out = await call(world, 'browser_focus', { target: 'T1' });
     expect(out.failed).toBe(true);
     expect(out.text).toContain('借的是操作员日常那个浏览器');
   });
 
   it('操作员关掉"允许她弹"时，browser_focus 拒绝（页面留在屏幕外）', async () => {
-    const proxy = await fakeProxy();
-    const cdp = await fakeBrowserCdp();
-    proxy.chromePort = cdp.port;
-    const world = startedWorld(proxy.port, { ...ownPatch(cdp.port), bringToFront: false });
-    await world.start(new FakeHost());
-
+    const fake = await makeFake();
+    const world = ownWorld(fake, { bringToFront: false });
     const out = await call(world, 'browser_focus', { target: 'T1' });
     expect(out.failed).toBe(true);
     expect(out.text).toContain('不想被打断');
   });
 
   it('专属实例下开页建的是"她自己的窗口"；建不成时退回后台 tab，并在回执里说明', async () => {
-    const proxy = await fakeProxy();
-    const cdp = await fakeBrowserCdp(); // 它的 ws 地址不是真的 WebSocket 服务，所以建窗口必失败
-    proxy.chromePort = cdp.port;
-    proxy.evalReply = () => PAGE_DUMP;
-    const world = startedWorld(proxy.port, ownPatch(cdp.port));
+    const fake = await makeFake();
+    fake.controls.createWindowFails = true;
+    fake.controls.evalReply = () => PAGE_DUMP;
+    const world = ownWorld(fake);
     await world.start(new FakeHost());
 
     const out = await call(world, 'browser_open', { url: 'example.com/a' });
@@ -1019,15 +758,12 @@ describe('她自己的浏览器实例', () => {
     expect(out.text).toContain('已打开');
     // 退回那条路要说清代价（媒体播不了），而不是静默降级。
     expect(out.text).toContain('退回了后台 tab');
-    expect(proxy.hits).toContain('/new');
+    expect(fake.controls.windowCreateAttempts).toBe(1);
   });
 
   it('视频自动展示遵守弹窗权限，操作员手动展示可在关掉权限后使用', async () => {
-    const proxy = await fakeProxy();
-    const cdp = await fakeBrowserCdp();
-    proxy.chromePort = cdp.port;
-    const world = startedWorld(proxy.port, { ...ownPatch(cdp.port), bringToFront: false });
-    await world.start(new FakeHost());
+    const fake = await makeFake();
+    const world = ownWorld(fake, { bringToFront: false });
     const internals = world as unknown as {
       show: (target: string) => Promise<unknown>;
       video: { opts: { present: (target: string, by: 'operator' | 'bot') => Promise<string> } };
@@ -1040,11 +776,9 @@ describe('她自己的浏览器实例', () => {
   });
 
   it('开页不再自动弹到他眼前：专属实例下 open 不碰窗口位置/激活', async () => {
-    const proxy = await fakeProxy();
-    const cdp = await fakeBrowserCdp();
-    proxy.chromePort = cdp.port;
-    proxy.evalReply = () => PAGE_DUMP;
-    const world = startedWorld(proxy.port, ownPatch(cdp.port));
+    const fake = await makeFake();
+    fake.controls.evalReply = () => PAGE_DUMP;
+    const world = ownWorld(fake);
     await world.start(new FakeHost());
 
     const out = await call(world, 'browser_open', { url: 'example.com/a' });
@@ -1054,13 +788,11 @@ describe('她自己的浏览器实例', () => {
     expect(out.text).not.toContain('搬到');
   });
 
-  it('她自己开的窗口闲置太久会被收掉（上游不认识这些窗口，回收在这里）', async () => {
-    const proxy = await fakeProxy();
-    const cdp = await fakeBrowserCdp();
-    proxy.chromePort = cdp.port;
-    proxy.evalReply = () => PAGE_DUMP;
+  it('她自己开的窗口闲置太久会被收掉（回收在这里）', async () => {
+    const fake = await makeFake();
+    fake.controls.evalReply = () => PAGE_DUMP;
     // 0.00005 分钟 ≈ 3 毫秒：用极小值来验"到点就收"，不必真等一分钟。
-    const world = startedWorld(proxy.port, { ...ownPatch(cdp.port), tabIdleMinutes: 0.00005 });
+    const world = ownWorld(fake, { tabIdleMinutes: 0.00005 });
     await world.start(new FakeHost());
 
     const opened = await call(world, 'browser_open', { url: 'example.com/a' });
@@ -1069,15 +801,13 @@ describe('她自己的浏览器实例', () => {
 
     await sleep(20);
     await call(world, 'browser_tabs'); // 任何一次工具调用都会顺手扫一遍
-    expect(proxy.closed).toContain(target);
+    expect(fake.controls.closed).toContain(target);
   });
 
   it('观看租约保留视频页，同时回收其他闲置页；释放后视频页也可回收', async () => {
-    const proxy = await fakeProxy();
-    const cdp = await fakeBrowserCdp();
-    proxy.chromePort = cdp.port;
-    proxy.evalReply = () => PAGE_DUMP;
-    const world = startedWorld(proxy.port, { ...ownPatch(cdp.port), tabIdleMinutes: 0.00005 });
+    const fake = await makeFake();
+    fake.controls.evalReply = () => PAGE_DUMP;
+    const world = ownWorld(fake, { tabIdleMinutes: 0.00005 });
     await world.start(new FakeHost());
     let leaseTarget = '';
     const lease = vi.spyOn(BilibiliSession.prototype, 'protects').mockImplementation(target => target === leaseTarget);
@@ -1088,13 +818,13 @@ describe('她自己的浏览器实例', () => {
       const otherTarget = /target (T\d+)/.exec(other.text)![1];
       await sleep(20);
       await call(world, 'browser_tabs');
-      expect(proxy.closed).not.toContain(leaseTarget);
-      expect(proxy.closed).toContain(otherTarget);
+      expect(fake.controls.closed).not.toContain(leaseTarget);
+      expect(fake.controls.closed).toContain(otherTarget);
       const released = leaseTarget;
       leaseTarget = '';
       await call(world, 'browser_tabs');
       await sleep(10);
-      expect(proxy.closed).toContain(released);
+      expect(fake.controls.closed).toContain(released);
     } finally { lease.mockRestore(); }
   });
 });
@@ -1130,9 +860,9 @@ describe('搜索', () => {
   };
 
   it('browser_search：一次调用给出候选地址，并说清下一步怎么用', async () => {
-    const proxy = await fakeProxy();
-    proxy.evalReply = (expression) => (isHarvest(expression) ? { ok: true, value: HITS } : PAGE_DUMP);
-    const world = startedWorld(proxy.port, { skillDir: scratchDir });
+    const fake = await makeFake();
+    fake.controls.evalReply = (expression) => (isHarvest(expression) ? { ok: true, value: HITS } : PAGE_DUMP);
+    const world = await borrowedWorld(fake);
     await world.start(new FakeHost());
 
     const out = await call(world, 'browser_search', { query: '怎么挑机械键盘' });
@@ -1146,8 +876,8 @@ describe('搜索', () => {
     expect(out.text).toContain('browser_open');
     expect(out.text).toContain('别去点结果页上的链接');
     // 关键词进了结果页地址（URL 编码过）。
-    expect(proxy.navBodies.at(-1)).toContain('cn.bing.com/search?q=');
-    expect(proxy.navBodies.at(-1)).toContain(encodeURIComponent('怎么挑机械键盘'));
+    expect(fake.controls.navBodies.at(-1)).toContain('cn.bing.com/search?q=');
+    expect(fake.controls.navBodies.at(-1)).toContain(encodeURIComponent('怎么挑机械键盘'));
     // 结果页留给她：回执里有 target，browser_close 认它。
     const target = /target (T\d+)/.exec(out.text)?.[1] ?? '';
     expect(target).not.toBe('');
@@ -1156,8 +886,8 @@ describe('搜索', () => {
   });
 
   it('browser_search：换引擎走那个引擎的结果页，跳转链接会被标出来', async () => {
-    const proxy = await fakeProxy();
-    proxy.evalReply = (expression) =>
+    const fake = await makeFake();
+    fake.controls.evalReply = (expression) =>
       isHarvest(expression)
         ? {
             ok: true,
@@ -1169,21 +899,21 @@ describe('搜索', () => {
             },
           }
         : PAGE_DUMP;
-    const world = startedWorld(proxy.port, { skillDir: scratchDir });
+    const world = await borrowedWorld(fake);
     await world.start(new FakeHost());
 
     const out = await call(world, 'browser_search', { query: '机械键盘', engine: 'sogou' });
     expect(out.text).toContain('搜狗');
-    expect(proxy.navBodies.at(-1)).toContain('sogou.com/web?query=');
+    expect(fake.controls.navBodies.at(-1)).toContain('sogou.com/web?query=');
     expect(out.text).toContain('（跳转链接）');
     expect(out.text).toContain('看不出是哪个站点');
   });
 
   it('browser_search：一条都没抽到时退回整页正文，并说清是哪种没命中', async () => {
-    const proxy = await fakeProxy();
-    proxy.evalReply = (expression) =>
+    const fake = await makeFake();
+    fake.controls.evalReply = (expression) =>
       isHarvest(expression) ? { ok: true, value: { anchors: 0, hits: [], title: '验证', url: 'https://cn.bing.com/verify' } } : PAGE_DUMP;
-    const world = startedWorld(proxy.port, { skillDir: scratchDir });
+    const world = await borrowedWorld(fake);
     await world.start(new FakeHost());
 
     const out = await call(world, 'browser_search', { query: '机械键盘' });
@@ -1194,9 +924,9 @@ describe('搜索', () => {
   });
 
   it('browser_search：空查询和未知引擎失败；不指定时沿用旧默认值', async () => {
-    const proxy = await fakeProxy();
-    proxy.evalReply = (expression) => (isHarvest(expression) ? { ok: true, value: HITS } : PAGE_DUMP);
-    const world = startedWorld(proxy.port, { skillDir: scratchDir, searchEngine: 'sogou' });
+    const fake = await makeFake();
+    fake.controls.evalReply = (expression) => (isHarvest(expression) ? { ok: true, value: HITS } : PAGE_DUMP);
+    const world = await borrowedWorld(fake, { searchEngine: 'sogou' });
     await world.start(new FakeHost());
 
     const blank = await call(world, 'browser_search', {});
@@ -1205,22 +935,23 @@ describe('搜索', () => {
 
     const invalid = await call(world, 'browser_search', { query: '机械键盘', engine: 'google' });
     expect(invalid.failed).toBe(true);
-    expect(proxy.navBodies).toHaveLength(0);
+    expect(fake.controls.navBodies).toHaveLength(0);
     const out = await call(world, 'browser_search', { query: '机械键盘' });
-    expect(proxy.navBodies.at(-1)).toContain('sogou.com/web?query=');
+    expect(fake.controls.navBodies.at(-1)).toContain('sogou.com/web?query=');
     expect(out.text).toContain('搜狗');
   });
 });
 
 describe('点击开出来的新页面（2026-10-12 加的）', () => {
   it('真鼠标点开一张新页面时写进回执；借他那个浏览器时不登记成她的（怕认下他自己开的）', async () => {
-    const proxy = await fakeProxy();
-    proxy.clickOpens = { url: 'https://zhuanlan.zhihu.com/p/257307801', title: '机械键盘推荐' };
-    const world = startedWorld(proxy.port, { skillDir: scratchDir });
+    const fake = await makeFake();
+    fake.controls.pages = [{ targetId: 'X1', url: 'https://cn.bing.com/search?q=x', title: '结果页' }];
+    fake.controls.clickOpens = { url: 'https://zhuanlan.zhihu.com/p/257307801', title: '机械键盘推荐' };
+    const world = await borrowedWorld(fake);
     await world.start(new FakeHost());
 
     const out = await call(world, 'browser_click', {
-      target: 'T1',
+      target: 'X1',
       selector: '#b_results > li.b_algo h2 a',
       native: true,
     });
@@ -1236,22 +967,13 @@ describe('点击开出来的新页面（2026-10-12 加的）', () => {
   });
 
   it('专属实例里点开的新页面登记成她的：能关、也会被闲置回收', async () => {
-    const proxy = await fakeProxy();
-    const cdp = await fakeBrowserCdp();
-    proxy.chromePort = cdp.port;
-    proxy.clickOpens = { url: 'https://zhuanlan.zhihu.com/p/257307801', title: '机械键盘推荐' };
-    const world = startedWorld(proxy.port, {
-      skillDir: scratchDir,
-      browser: 'chrome',
-      ownBrowser: true,
-      ownBrowserExe: writeFakeExe(scratchDir),
-      ownBrowserHome: join(scratchDir, 'home'),
-      ownBrowserPort: cdp.port,
-      tabIdleMinutes: 0.00005,
-    });
+    const fake = await makeFake();
+    fake.controls.pages = [{ targetId: 'X1', url: 'https://cn.bing.com/search?q=x', title: '结果页' }];
+    fake.controls.clickOpens = { url: 'https://zhuanlan.zhihu.com/p/257307801', title: '机械键盘推荐' };
+    const world = ownWorld(fake, { tabIdleMinutes: 0.00005 });
     await world.start(new FakeHost());
 
-    const out = await call(world, 'browser_click', { target: 'T1', selector: 'a.result', native: true });
+    const out = await call(world, 'browser_click', { target: 'X1', selector: 'a.result', native: true });
     expect(out.text).toContain('点击开出了一张新页面');
     expect(out.text).toContain('已经记成我开的');
     const target = /target: (T\d+)/.exec(out.text)?.[1] ?? '';
@@ -1261,11 +983,106 @@ describe('点击开出来的新页面（2026-10-12 加的）', () => {
   });
 
   it('没开出新页面时，回执一个字都不多写', async () => {
-    const proxy = await fakeProxy();
-    const world = startedWorld(proxy.port, { skillDir: scratchDir });
+    const fake = await makeFake();
+    fake.controls.pages = [{ targetId: 'X1', url: 'https://cn.bing.com/search?q=x', title: '结果页' }];
+    const world = await borrowedWorld(fake);
     await world.start(new FakeHost());
 
-    const out = await call(world, 'browser_click', { target: 'T1', selector: 'button.submit' });
+    const out = await call(world, 'browser_click', { target: 'X1', selector: 'button.submit' });
     expect(out.text).not.toContain('新页面');
+  });
+});
+
+// ——— find-url（0.4.0 起在包内）：直接对着模块测 ———
+
+const WEBKIT_FIX = 11644473600000000n;
+
+/** 一份真的会用 node:sqlite 造出来的 History 库 + 一个书签 JSON。 */
+function writeFindUrlFixture(root: string, profileNames: Array<[string, string]> = [['Default', 'Default']]): void {
+  const userDir = join(root, 'Google', 'Chrome', 'User Data');
+  for (const [dir] of profileNames) {
+    const profileDir = join(userDir, dir);
+    mkdirSync(profileDir, { recursive: true });
+    writeFileSync(join(profileDir, 'Bookmarks'), JSON.stringify({
+      roots: {
+        bookmark_bar: {
+          type: 'folder', name: '书签栏',
+          children: [
+            { type: 'url', name: '内部系统', url: 'https://intra.example.com/dash' },
+            { type: 'folder', name: '工作', children: [
+              { type: 'url', name: '周报', url: 'https://intra.example.com/weekly' },
+            ] },
+          ],
+        },
+      },
+    }));
+    const db = new (nodeRequire('node:sqlite').DatabaseSync as new (path: string) => { exec: (sql: string) => void; prepare: (sql: string) => { run: (...args: unknown[]) => void }; close: () => void })(join(profileDir, 'History'));
+    db.exec('CREATE TABLE urls (id INTEGER PRIMARY KEY, title TEXT, url TEXT, visit_count INTEGER, last_visit_time INTEGER)');
+    const nowUs = BigInt(Date.now()) * 1000n + WEBKIT_FIX;
+    const oldUs = BigInt(Date.now() - 10 * 86_400_000) * 1000n + WEBKIT_FIX;
+    const insert = db.prepare('INSERT INTO urls (title, url, visit_count, last_visit_time) VALUES (?, ?, ?, ?)');
+    insert.run('内部系统首页', 'https://intra.example.com/dash', 3, nowUs);
+    insert.run('很久以前看过的页', 'https://elsewhere.example.com/old', 1, oldUs);
+    db.close();
+  }
+  writeFileSync(join(userDir, 'Local State'), JSON.stringify({
+    profile: { info_cache: Object.fromEntries(profileNames.map(([dir, name]) => [dir, { name }])) },
+  }));
+}
+
+describe('find-url（包内实现）', () => {
+  it('书签：关键词 AND、文件夹路径都进回执', async () => {
+    writeFindUrlFixture(scratchDir);
+    const out = await findUrl({ keywords: ['内部系统'] }, { ownHome: scratchDir }, 5000);
+    expect(out.ok).toBe(true);
+    expect(out.output).toContain('[书签] 1 条');
+    expect(out.output).toContain('内部系统 | https://intra.example.com/dash | 书签栏');
+  });
+
+  it('书签没有关键词时不返回（书签无时间维度）', async () => {
+    writeFindUrlFixture(scratchDir);
+    const out = await findUrl({ keywords: [] }, { ownHome: scratchDir }, 5000);
+    expect(out.output).toContain('[书签] 0 条');
+  });
+
+  it('历史：按最近访问排，visits 多的带标注，since 把老的滤掉', async () => {
+    writeFindUrlFixture(scratchDir);
+    const recent = await findUrl({ keywords: [], only: 'history' }, { ownHome: scratchDir }, 5000);
+    expect(recent.ok).toBe(true);
+    expect(recent.output).toContain('[历史] 2 条（按最近访问）');
+    expect(recent.output).toContain('visits=3');
+    expect(recent.output.indexOf('内部系统首页')).toBeLessThan(recent.output.indexOf('很久以前看过的页'));
+
+    const sinceDay = await findUrl({ keywords: [], only: 'history', since: '1d' }, { ownHome: scratchDir }, 5000);
+    expect(sinceDay.output).toContain('[历史] 1 条');
+    expect(sinceDay.output).toContain('内部系统首页');
+    expect(sinceDay.output).not.toContain('很久以前看过的页');
+  });
+
+  it('历史：按访问次数排；跨 profile 合并时带 @ 标注', async () => {
+    writeFindUrlFixture(scratchDir, [['Default', '日常'], ['Profile 1', '工作']]);
+    const out = await findUrl(
+      { keywords: [], only: 'history', sort: 'visits' },
+      { ownHome: scratchDir },
+      5000,
+    );
+    expect(out.output).toContain('按访问次数');
+    // 只横跨了多个 profile（浏览器只有一个）：按上游口径只标 profile。
+    expect(out.output).toContain('@日常');
+    expect(out.output).toContain('@工作');
+  });
+
+  it('参数错与数据目录缺失都说得清', async () => {
+    const badSince = await findUrl({ keywords: ['x'], since: '明天' }, { ownHome: scratchDir }, 5000);
+    expect(badSince.ok).toBe(false);
+    expect(badSince.output).toContain('无效 --since 值');
+
+    const noEdge = await findUrl({ keywords: ['x'], browser: 'edge' }, { ownHome: scratchDir }, 5000);
+    expect(noEdge.ok).toBe(false);
+    expect(noEdge.output).toContain('未找到浏览器 edge 的用户数据目录');
+
+    const empty = await findUrl({ keywords: ['x'] }, { ownHome: join(scratchDir, '没有这个家') }, 5000);
+    expect(empty.ok).toBe(false);
+    expect(empty.output).toContain('未找到任何浏览器');
   });
 });

@@ -1,20 +1,21 @@
 /**
- * 开发用冒烟：不经过 Cortico，直接对着本机真的 cdp-proxy 走一遍。
+ * 开发用冒烟：不经过 Cortico，直接对着本机真的浏览器走一遍（引擎就是包里的那份）。
  *
  * 两种用法：
  *
  *   1) 借操作员日常那个浏览器（原样，没变）：
- *      pnpm smoke [--skill-dir C:\tools\web-access] [--browser chrome] [--port 3517] [--url https://example.com]
+ *      pnpm smoke [--browser chrome] [--url https://example.com]
+ *      要求那个浏览器开着远程调试开关（browser://inspect#remote-debugging）。
  *
  *   2) 她自己的实例（2026-10-01 加的那条路）：
- *      pnpm smoke --own [--exe <chrome.exe>] [--home <她的"家">] [--cdp-port 9223] [--port 3517]
+ *      pnpm smoke --own [--exe <chrome.exe>] [--home <她的"家">] [--cdp-port 9223]
  *
- * 第 2 种会：先把她的实例拉起来（探活→复用→才 spawn）→ 把"家"当 LOCALAPPDATA 拉起 proxy →
- * 核对 proxy 连的确实是那个端口 → **在本地跑一次"能不能播"的验证**（起一个本机小服务，
- * 页面里不靠用户手势调 play()，看 currentTime 有没有走起来）→ **再验一次"搬到他眼前"能成**
- * （窗口回屏幕内、且抬到了当前前台窗口之上），最后截图、关页、只关自己拉起的进程。
+ * 第 2 种会：先把她的实例拉起来（探活→复用→才 spawn）→ **在本地跑一次"能不能播"的验证**
+ * （起一个本机小服务，页面里不靠用户手势调 play()，看 currentTime 有没有走起来）→
+ * **再验一次"搬到他眼前"能成**（窗口回屏幕内、且抬到了当前前台窗口之上），最后截图、关页、
+ * 只关自己拉起的进程。
  *
- * 浏览器没打开远程调试开关（第 1 种）或实例起不来（第 2 种）时，它会说清卡在哪并以退出码 1 结束——
+ * 浏览器没开远程调试开关（第 1 种）或实例起不来（第 2 种）时，它会说清卡在哪并以退出码 1 结束——
  * 那是预期结果，不是脚本坏了。
  */
 import { createServer, type Server } from 'node:http';
@@ -22,7 +23,7 @@ import { writeFileSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CdpRelay } from '../src/cdp-client.ts';
+import { CdpEngine } from '../src/cdp-engine.ts';
 import { OwnBrowser, createWindow, showTarget, windowBounds } from '../src/own-browser.ts';
 import { readExpression } from '../src/page-scripts.ts';
 import {
@@ -43,9 +44,7 @@ function flag(name: string): boolean {
   return process.argv.slice(2).includes(`--${name}`);
 }
 
-const skillDir = arg('skill-dir', 'C:\\tools\\web-access');
 const browser = arg('browser', 'chrome');
-const port = Number(arg('port', '3517'));
 const own = flag('own');
 /** 顺手再开一个真实站点看一眼；她自己的实例那条路默认不开（先看本地那条"能不能播"）。 */
 const extraUrl = arg('url', own ? '' : 'https://example.com');
@@ -63,7 +62,7 @@ const log = {
   debug: (message: string) => console.log(String(message)),
   trace: () => {},
   emit: () => {},
-} as unknown as Parameters<CdpRelay['spawnProxy']>[0];
+};
 
 // ——— 本机测试页：验"后台 tab 播不动 / 带到前台就能播"这一条 ———
 
@@ -144,7 +143,6 @@ async function withMediaServer<T>(fn: (url: string) => Promise<T>): Promise<T> {
 
 // ——— 走一遍 ———
 
-console.log(`skillDir = ${skillDir}`);
 let ownBrowser: OwnBrowser | null = null;
 
 if (own) {
@@ -160,68 +158,30 @@ if (own) {
   console.log(`实例就绪（${ownBrowser.owned ? '这次拉起的' : '复用已在跑的'}）`);
 }
 
-const relay = new CdpRelay({
-  skillDir,
+const engine = new CdpEngine({
   browser,
-  port,
+  ...(own ? { fixedPort: cdpPort } : {}),
   tabIdleMinutes: 15,
-  ...(own ? { localAppDataRoot: home } : {}),
 });
 
-console.log(`proxy    = ${relay.endpoint()}（浏览器 ${browser}）`);
+console.log(own ? `引擎直连她的实例（127.0.0.1:${cdpPort}）` : `引擎按配置发现 ${browser} 的调试口`);
 
-const before = await relay.probe();
-if (before) {
-  console.log(`已有 proxy 在跑：connected=${before.connected} browser=${before.browserLabel || before.browserId || '未识别'}`);
-} else {
-  console.log('端口上没有 proxy，自己拉起。');
-  const portProblem = await relay.checkPort();
-  if (portProblem) {
-    console.error(portProblem);
-    console.error('换一个端口再跑：pnpm smoke --port 3600');
-    process.exit(1);
+const problem = await engine.connect(log, 30000);
+if (problem) {
+  console.error(`浏览器没连上：${problem}`);
+  if (!own) {
+    console.error(`提示：${browser}://inspect/#remote-debugging 勾选「Allow remote debugging for this browser instance」。`);
   }
-  if (!relay.spawnProxy(log)) {
-    console.error(`拉起失败：${relay.failure}`);
-    process.exit(1);
-  }
-}
-
-let ok = false;
-for (let i = 0; i < 30; i += 1) {
-  if (await relay.reachable()) {
-    ok = true;
-    break;
-  }
-  await new Promise((resolve) => setTimeout(resolve, 1000));
-}
-
-const health = await relay.probe();
-console.log(
-  `/health：connected=${health?.connected ?? '?'} browser=${health?.browserLabel || health?.browserId || '未识别'}` +
-    ` chromePort=${health?.chromePort ?? '?'}`,
-);
-
-if (!ok) {
-  console.error('浏览器没接上：去对应浏览器的 inspect 页面勾选允许远程调试，再跑一次。');
-  console.error(`提示：${browser}://inspect/#remote-debugging`);
-  await relay.stop();
+  await engine.stop();
   ownBrowser?.stop();
   process.exit(1);
 }
-
-if (own && health?.chromePort && health.chromePort !== cdpPort) {
-  console.error(`proxy 连的是 ${health.chromePort}，不是她的实例（${cdpPort}）：先停掉那个 proxy 再跑。`);
-  await relay.stop();
-  ownBrowser?.stop();
-  process.exit(1);
-}
-
-console.log('浏览器已接上，开始走一遍：');
+console.log(`浏览器已接上：${engine.browserLabel || '未识别'} · 调试口 127.0.0.1:${engine.browserPort}`);
+console.log('开始走一遍：');
 
 /**
  * 与 World 同一条路：专属模式下建"她自己的窗口"（不激活、屏幕外），再单独导航。
- * 借他日常那个浏览器时仍旧是上游 `/new` 那个后台 tab。
+ * 借他日常那个浏览器时是引擎开的后台 tab。
  */
 async function openAndRead(url: string, maxChars = 1200): Promise<string> {
   let target: string;
@@ -230,12 +190,12 @@ async function openAndRead(url: string, maxChars = 1200): Promise<string> {
     target = created.targetId;
     console.log(`  开了她的窗口：target=${target}`);
   } else {
-    target = await relay.openBlank(30000);
+    target = await engine.openBlank(30000);
     console.log(`  开了新页：target=${target}`);
   }
-  await relay.navigate(target, url, 35000);
+  await engine.navigate(target, url, 35000);
   console.log(`  导航到 ${url}`);
-  const dump = await relay.evaluate(target, readExpression(null, maxChars), 30000);
+  const dump = await engine.evaluate(target, readExpression(null, maxChars), 30000);
   if (dump.ok) {
     const page = dump.value as { title?: string; url?: string; text?: string; links?: unknown[] };
     console.log(`  标题：${page.title ?? ''}`);
@@ -259,11 +219,11 @@ if (own) {
 
     // ② 没有做过任何"调前台"，页面也该是活的、媒体在走。
     await new Promise((resolve) => setTimeout(resolve, 2200));
-    const read = await relay.evaluate(target, MEDIA_READ, 15000);
+    const read = await engine.evaluate(target, MEDIA_READ, 15000);
     const state = read.ok ? (read.value as string) : `读不到：${read.error}`;
     console.log(`  媒体状态（未做任何调前台）：${state}`);
 
-    const shot = await relay.screenshot(target, 30000);
+    const shot = await engine.screenshot(target, 30000);
     const shotPath = join(tmpdir(), 'cortico-browser-smoke.png');
     writeFileSync(shotPath, shot);
     console.log(`  截图：${shot.length} 字节，写到 ${shotPath}`);
@@ -279,7 +239,7 @@ if (own) {
         (shown.raise.why ? ` why=${shown.raise.why}` : ''),
     );
 
-    await relay.close(target, 30000);
+    await engine.close(target, 30000);
     console.log(`  关掉了 ${target}`);
 
     const parsed = read.ok
@@ -302,7 +262,7 @@ if (own) {
   if (verdict.pass) console.log(`她的浏览器这条：过 —— ${verdict.detail}`);
   else {
     console.error(`她的浏览器这条：没过 —— ${verdict.detail}`);
-    await relay.stop();
+    await engine.stop();
     ownBrowser?.stop();
     process.exit(1);
   }
@@ -316,43 +276,42 @@ if (extraUrl !== '') await openAndRead(extraUrl);
  *
  * 判据：条目至少一条，且**每一条都得是真地址**（Bing 那一路；跳转链接的引擎不算，见下面那句提醒）。
  */
-async function searchSmoke(engine: SearchEngineId): Promise<boolean> {
+async function searchSmoke(id: SearchEngineId): Promise<boolean> {
   const query = '怎么挑机械键盘';
   let target: string;
   if (own) {
     const created = await createWindow(cdpPort, 'about:blank', 5000);
     target = created.targetId;
   } else {
-    target = await relay.openBlank(30000);
+    target = await engine.openBlank(30000);
   }
   console.log(`\n搜索（${engine}）：「${query}」`);
-  await relay.navigate(target, searchUrl(engine, query), 35000);
-  const harvest = await relay.evaluate(target, searchExpression(engine, 10), 30000);
-  const normalized = harvest.ok ? normalizeHarvest(harvest.value, engine) : null;
+  await engine.navigate(target, searchUrl(id, query), 35000);
+  const harvest = await engine.evaluate(target, searchExpression(id, 10), 30000);
+  const normalized = harvest.ok ? normalizeHarvest(harvest.value, id) : null;
   if (!normalized) {
     console.error(`  抽取这一发没回成形的收获：${harvest.ok ? '形状不认' : harvest.error}`);
-    await relay.close(target, 30000).catch(() => {});
+    await engine.close(target, 30000).catch(() => {});
     return false;
   }
-  console.log(renderSearch(engine, query, normalized, { target }));
+  console.log(renderSearch(id, query, normalized, { target }));
   const ok = normalized.hits.length > 0;
   // 收页面这件事别默默失败：留一张结果页在她的窗口里，是下一眼会困惑的东西。
-  const closed = await relay.close(target, 30000).then(() => true).catch(() => false);
+  const closed = await engine.close(target, 30000).then(() => true).catch(() => false);
   console.log(`  搜索这条：${ok ? '过' : '没过'}（锚点 ${normalized.anchors} 个，条目 ${normalized.hits.length} 条）${closed ? '' : `，收页面没成：${target} 可能还开着`}`);
   return ok;
 }
 
 if (!(await searchSmoke(searchEngine))) {
   console.error('搜索结果页上一条都没抽出来：引擎多半换了页面结构，或者它给了验证页。');
-  await relay.stop();
+  await engine.stop();
   ownBrowser?.stop();
   process.exit(1);
 }
 
-// 谁是自己拉起的、谁是复用来的，要在 stop() 之前读：stop() 会把记录清掉。
-const relayWasOurs = relay.owned;
+// 引擎停机时会顺手关掉它自己开出来的那批后台 tab；她的窗口不在那批里，不受影响。
 const browserWasOurs = ownBrowser?.owned ?? false;
-await relay.stop();
+await engine.stop();
 ownBrowser?.stop();
-console.log(relayWasOurs ? '（proxy 是这次拉起的，已关）' : '（proxy 是复用的，没关它）');
 if (ownBrowser) console.log(browserWasOurs ? '（她的浏览器是这次拉起的，已关）' : '（她的浏览器是复用的，没关它）');
+console.log('（引擎建出来的后台 tab 已随手关掉）');

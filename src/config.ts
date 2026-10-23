@@ -13,28 +13,16 @@ export interface BrowserConfigSection {
   video: VideoConfig;
   enabled: boolean;
   /**
-   * 装了 web-access 的那个目录，里面有 `scripts/cdp-proxy.mjs` 与 `scripts/find-url.mjs`。
-   * 本 World 从这里拉起 proxy，也从这里找书签历史检索脚本。
-   */
-  skillDir: string;
-  /**
    * 操作哪个浏览器：`chrome` / `edge` / `chromium`。
-   * 拉起 proxy 时经 `--browser` 传给它——上游在既没收到这个参数、也没有自己的 config.env 时
-   * 不会自己挑浏览器（哪怕只检测到一个），所以这里必须点名。
+   * 借操作员的浏览器时按它去发现调试口（严格匹配，找不到就报「去开远程调试开关」）；
+   * 专属实例模式只要求它是 `chrome`。
    */
   browser: string;
-  /**
-   * proxy 的监听端口，与上游的 `CDP_PROXY_PORT` 对应。
-   *
-   * 默认 3517：上游默认的 3456 落在 Windows 保留的端口段里（这台机器上是 3417–3516），
-   * 绑上去会以 EACCES 失败，上游却把这种情况报成「端口已被占用」。
-   */
-  port: number;
-  /** 拉起 proxy 之后，等它连上浏览器的上限。 */
+  /** 连上浏览器的上限（发现 + WebSocket 握手 + 验证都算在里面）。 */
   readyTimeoutMs: number;
-  /** 单次 HTTP 调用的往返超时。 */
+  /** 单次调用的超时。 */
   requestTimeoutMs: number;
-  /** 本 World 拉起的那个 proxy 里，页面闲置多久被自动关掉（上游默认 15 分钟）。 */
+  /** 页面闲置多久被自动关掉（分钟）。管的是她开出来的页面；操作员自己的页面永远不动。 */
   tabIdleMinutes: number;
   /**
    * 给她一个**专属的浏览器实例**（独立 profile、独立调试端口），由本 World 起停。
@@ -48,8 +36,7 @@ export interface BrowserConfigSection {
   ownBrowserExe: string;
   /**
    * `ownBrowser` 开着时必填：她的浏览器"家"目录。profile 落在
-   * `<home>/Google/Chrome/User Data`（照 Chrome 自己的布局，上游据此发现它），
-   * 发现文件也写在那里。
+   * `<home>/Google/Chrome/User Data`（照 Chrome 自己的布局，书签历史检索也按这个布局找她的数据）。
    */
   ownBrowserHome: string;
   /** 这个实例的 CDP 调试端口。别和操作员那个浏览器的撞（Edge 常用 9222）。 */
@@ -70,9 +57,7 @@ export const BROWSER_DEFAULTS: BrowserConfigSection = {
   search: structuredClone(SEARCH_DEFAULTS),
   video: structuredClone(VIDEO_DEFAULTS),
   enabled: false,
-  skillDir: '',
   browser: '',
-  port: 3517,
   readyTimeoutMs: 30000,
   requestTimeoutMs: 30000,
   tabIdleMinutes: 15,
@@ -92,40 +77,28 @@ export const BROWSER_CONFIG_GROUP: ConfigGroup = {
     type: 'object',
     title: 'Browser',
     properties: {
-      'worlds.browser.skillDir': {
-        type: 'string',
-        title: 'web-access 目录',
-        description: '里面有 scripts/cdp-proxy.mjs，例如 C:\\tools\\web-access。必填：没填或目录不对，这个 World 起不来。改完要重启这个 World 才生效。',
-        'x-hot': false,
-      },
       'worlds.browser.browser': {
         type: 'string',
         title: '浏览器',
-        description: 'chrome / edge / chromium。必须是你要操作的那一个，而且已经打开它的远程调试开关；否则 proxy 连不上，World 起不来。改完要重启这个 World 才生效。',
+        description: 'chrome / edge / chromium。必须是你要操作的那一个，而且已经打开它的远程调试开关（专属实例模式下固定是 chrome）；否则连不上，World 起不来。改完要重启这个 World 才生效。',
         enum: ['chrome', 'edge', 'chromium'],
-        'x-hot': false,
-      },
-      'worlds.browser.port': {
-        type: 'integer',
-        title: 'proxy 端口',
-        description: '与上游 cdp-proxy 的监听端口一致，默认 3517（3456 在 Windows 保留段里，绑不上）。改完要重启这个 World 才生效。',
         'x-hot': false,
       },
       'worlds.browser.readyTimeoutMs': {
         type: 'integer',
         title: '就绪超时（毫秒）',
-        description: '拉起 proxy 后等它连上浏览器的上限，默认 30000。改完要重启这个 World 才生效。',
+        description: '启动时等浏览器连上的上限，默认 30000。改完要重启这个 World 才生效。',
         'x-hot': false,
       },
       'worlds.browser.requestTimeoutMs': {
         type: 'integer',
         title: '调用超时（毫秒）',
-        description: '单次 HTTP 调用的往返超时，默认 30000。慢站点上读整页可能不够用，可以调大。',
+        description: '单次调用的往返超时，默认 30000。慢站点上读整页可能不够用，可以调大。',
       },
       'worlds.browser.tabIdleMinutes': {
         type: 'integer',
         title: '闲置关页（分钟）',
-        description: '本 World 拉起的 proxy 里，页面闲置这么久被自动关掉，默认 15。改完要重启这个 World 才生效。',
+        description: '她开出来的页面闲置这么久被自动关掉，默认 15。改完要重启这个 World 才生效。',
         'x-hot': false,
       },
       'worlds.browser.ownBrowser': {
@@ -133,7 +106,8 @@ export const BROWSER_CONFIG_GROUP: ConfigGroup = {
         title: '用她自己的浏览器实例',
         description:
           '开着时本 World 会拉起一个专属 Chrome（独立 profile 与调试端口），不再借操作员日常那个。' +
-          '想让她放视频、并且不打扰操作员自己的浏览器时开着。代价：登录态不共享。改完要重启这个 World 才生效。',
+          '想让她放视频、并且不打扰操作员自己的浏览器时开着；这个模式**不用装任何别的东西、不用开任何开关**。' +
+          '代价：登录态不共享。改完要重启这个 World 才生效。',
         'x-hot': false,
       },
       'worlds.browser.ownBrowserExe': {
@@ -146,7 +120,7 @@ export const BROWSER_CONFIG_GROUP: ConfigGroup = {
         type: 'string',
         title: '她的浏览器"家"目录',
         description:
-          'profile 放在这个目录下的 Google\\Chrome\\User Data，上游据此发现它。' +
+          'profile 放在这个目录下的 Google\\Chrome\\User Data（照 Chrome 自己的布局）。' +
           '建议放工作区内的一个目录，例如 <工作区>\\state\\browser-home。改完要重启。',
         'x-hot': false,
       },

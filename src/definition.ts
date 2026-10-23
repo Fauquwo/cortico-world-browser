@@ -1,5 +1,4 @@
 import { existsSync } from 'node:fs';
-import { join } from 'node:path';
 import { describeTools, type WorldDefinition } from 'cortico/world.ts';
 import { VIDEO_TOOL_DECLS } from './video/tools.ts';
 import { BROWSER_DEFAULTS, type BrowserConfigSection } from './config.ts';
@@ -31,21 +30,10 @@ export const BROWSER: WorldDefinition<BrowserConfigSection> = {
   defaults: () => structuredClone(BROWSER_DEFAULTS),
 
   /**
-   * 激活前检查上游目录与浏览器名。漏配时在这里说清楚要填什么，
+   * 激活前检查浏览器名。漏配时在这里说清楚要填什么，
    * 而不是等运行起来之后静默地开不了页面。
    */
   preflight: (ctx) => {
-    const skillDir = ctx.cfg.skillDir.trim();
-    if (!skillDir) {
-      throw new Error('worlds.browser.skillDir 没配。填上装了 web-access 的目录（例如 C:\\tools\\web-access）。');
-    }
-    if (!existsSync(skillDir)) {
-      throw new Error(`worlds.browser.skillDir 指向的目录不存在：${skillDir}`);
-    }
-    // 只硬要求 cdp-proxy.mjs：find-url.mjs 是 2.5.0 起才有的，缺它只是少一个工具。
-    if (!existsSync(join(skillDir, 'scripts', 'cdp-proxy.mjs'))) {
-      throw new Error(`${skillDir}\\scripts 里没有 cdp-proxy.mjs，这看起来不是 web-access 的目录。`);
-    }
     const browser = ctx.cfg.browser.trim();
     if (!browser) {
       throw new Error('worlds.browser.browser 没配。填 chrome / edge / chromium——必须是你要操作的那一个。');
@@ -80,7 +68,7 @@ export const BROWSER: WorldDefinition<BrowserConfigSection> = {
       if (browser !== 'chrome') {
         throw new Error(
           `worlds.browser.ownBrowser 只拉了 Chrome（现在 browser = 「${browser}」）。` +
-            '专属实例的发现文件写在 Chrome 的布局下，指别的浏览器找不到它。',
+            '专属实例的 profile 按 Chrome 的布局放在 ownBrowserHome 下，指别的浏览器对不上。',
         );
       }
     }
@@ -176,8 +164,8 @@ export const BROWSER: WorldDefinition<BrowserConfigSection> = {
     events: [
       {type:'browser.video.state', description:{zh:'视频页或播放状态变化。',en:'Video page or playback state changed.'},trigger:'flush'},
       {type:'browser.video.scene', description:{zh:'观看中的画面拼图、字幕和历史弹幕。',en:'Frame montage, subtitles and historical video danmaku while watching.'},trigger:'debounce'},
-      { type: 'browser.ready', description: { zh: '浏览器与 cdp-proxy 都就绪了，工具可用。', en: 'The browser and cdp-proxy are ready; the tools are usable.' } },
-      { type: 'browser.down', description: { zh: '浏览器起不来或连不上（proxy 拉不起来、浏览器没接上、端口被占等），工具会报失败。', en: 'The browser could not be started or reached (proxy failed to launch, browser not connected, port taken); the tools report failure.' } },
+      { type: 'browser.ready', description: { zh: '浏览器连上了，工具可用。', en: 'The browser is connected; the tools are usable.' } },
+      { type: 'browser.down', description: { zh: '浏览器起不来或连不上（专属实例没起来、远程调试开关没打开等），工具会报失败。', en: 'The browser could not be started or reached (own instance failed to launch, remote debugging toggle off); the tools report failure.' } },
     ],
   },
 };

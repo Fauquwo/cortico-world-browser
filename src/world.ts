@@ -1,15 +1,15 @@
 /**
- * Browser World：把本机 web-access 的 CDP proxy 接成一个浏览器。
+ * Browser World：给她一个真正的浏览器。
  *
- * 环境是操作员日常用的那个浏览器（带着他所有网站的登录态）。这个类做三件事：
- * 管 proxy 的起停、把工具调用翻译成 HTTP 调用、把浏览器里他自己的动向报成事件。
+ * 0.4.0 起引擎在包内（`cdp-engine.ts` 直接对浏览器说 CDP），不再借 web-access 的 proxy——
+ * 装完这个包就是全部，唯一的"外部"是浏览器本身。
  *
- * 起停沿用 SenseVoice 那一套：先探活，通了就复用（他自己或 coding agent 已经在跑的情况下
- * 不重复拉起），探不通才 spawn，`stop()` 只关自己拉起的那个。起不来不抛错——投一条
- * `browser.down`，让工具去报失败，这样 bot 知道「手现在不能用」，而不是这个 World 整个消失。
+ * 环境默认是操作员日常用的那个浏览器（带着他所有网站的登录态），也可以配一个她专属的实例。
+ * 这个类做三件事：管连接的起停、把工具调用翻译成引擎调用、把浏览器里他自己的动向报成事件。
+ *
+ * 起停的口径：起不来不抛错——投一条 `browser.down`，让工具去报失败，这样 bot 知道
+ * 「手现在不能用」，而不是这个 World 整个消失。连接是无状态的：断了对下一次工具调用重连即可。
  */
-import { existsSync } from 'node:fs';
-import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type {
   ToolCallContext,
@@ -22,7 +22,8 @@ import type {
   WorldLamp,
 } from 'cortico/core/types.ts';
 import { nowIso } from 'cortico/core/util.ts';
-import { CdpRelay, RelayError, classifyRelayError, runFindUrl, type EvalResult, type PageTarget, type RelayFailureKind, type RelayHealth } from './cdp-client.ts';
+import { CdpEngine, EngineError, classifyEngineError, type EvalResult, type PageTarget, type EngineFailureKind } from './cdp-engine.ts';
+import { findUrl } from './find-url.ts';
 import { BilibiliSession, isBilibili } from './video/session.ts';
 import { VIDEO_DEFAULTS } from './video/config.ts';
 import { BrowserSearchService, BROWSER_FETCH_TOOL, type SearchServiceOptions } from './search-service.ts';
@@ -54,14 +55,12 @@ const LINKS_SHOWN = 20;
 const JS_VALUE_MAX = 30000;
 /** `browser_tabs` 的变化段最多列几条。 */
 const CHANGES_MAX = 12;
-/** 等就绪的轮询间隔。 */
-const READY_POLL_MS = 1000;
-/** `find-url.mjs` 跑一次的上限：它要开本机的 sqlite 历史库。 */
+/** `browser_find_url` 跑一次的上限：它要开本机的历史库。 */
 const FIND_URL_TIMEOUT_MS = 20000;
 /**
- * 导航那一段的下限超时。普通调用超时（`requestTimeoutMs`）默认 30 秒，而站点打不通时上游的
- * `Page.navigate` 正好要等它自己的 30 秒 CDP 超时才回话——客户端若也卡在 30 秒，拿到的只是本地
- * 那句 `aborted due to timeout`，真话被挡在外面。宽这 5 秒是为了拿到**上游自己的回答**。
+ * 导航那一段的下限超时。导航要等页面加载（引擎里 15 秒的轮询预算），普通调用超时
+ * （`requestTimeoutMs`）默认 30 秒——慢站点上把导航卡在 30 秒里，回执只能说「没等到」；
+ * 宽出来这 5 秒给引擎把加载等到位、或者把真实的失败带回来。
  */
 const NAV_TIMEOUT_MIN_MS = 35_000;
 /** 导航没成之后，再试读一次那块内容用的短超时：页面那一侧可能还卡着，别把调用再拖长一轮。 */
@@ -72,23 +71,23 @@ const NAV_FAILED_DUMP_MS = 5000;
  *
  * 关键是**别让她以为浏览器坏了**：2026-09-30 那天她连着三次 `browser_open example.com` 拿到
  * 「连不上 cdp-proxy + 去开远程调试」，顺手把「browser 别再试了」写进了自己的笔记——而浏览器
- * 与 proxy 全程都是好的，打不开的是那个域名。
+ * 与连接全程都是好的，打不开的是那个域名。
  */
 const NAV_UNANSWERED_HINT =
-  '（proxy 与浏览器都是通的：多半是那个地址在这台机器上打不开、或者页面太慢。' +
+  '（连接与浏览器都是通的：多半是那个地址在这台机器上打不开、或者页面太慢。' +
   '先确认这个站点连得上，或换个地址再试——不是浏览器坏了。）';
 
 /** 这一类失败（命令发出去没回话）要说的话。 */
 const COMMAND_TIMEOUT_HINT =
-  '（proxy 与浏览器都是通的：是这一发命令没回话，多半那个页面自己卡着。换个页面或过一会儿再试。）';
+  '（连接与浏览器都是通的：是这一发命令没回话，多半那个页面自己卡着。换个页面或过一会儿再试。）';
 
 /** 失败归类在回执里的说法。 */
-const FAILURE_LABEL: Record<RelayFailureKind | 'nav', string> = {
-  unreachable: '连不上 proxy',
+const FAILURE_LABEL: Record<EngineFailureKind | 'nav', string> = {
+  unreachable: '连不上浏览器',
   'not-connected': '浏览器没连上',
   'command-timeout': '命令没回话',
   nav: '页面没打开',
-  relay: 'proxy 报错',
+  relay: '浏览器报错',
 };
 
 /** 浏览器的内部页面不进变化段：那不是「他去了哪儿」。 */
@@ -401,20 +400,18 @@ export const BROWSER_FIND_URL_TOOL: ToolSpec = {
 export class BrowserWorld implements World {
   readonly id = 'browser';
 
-  private readonly relay: CdpRelay;
+  private readonly engine: CdpEngine;
   private readonly video: BilibiliSession;
-  private readonly directPages = new Set<string>();
-  private readonly proxyTouchedAt = new Map<string, number>();
   /**
-   * 配了专属实例时才有：她的浏览器由本 World 起停，并且我们还要直接对它说一句 CDP
-   * （`Target.activateTarget`，上游没有这个端点）。没配时为 null，一切照旧。
+   * 配了专属实例时才有：她的浏览器由本 World 起停，建窗口、搬窗口这些窗口动作走它。
+   * 没配时为 null，一切照旧（借操作员的浏览器）。
    */
   private readonly own: OwnBrowser | null;
   private host: WorldHost | null = null;
   private running = false;
   private state: 'idle' | 'starting' | 'ready' | 'failed' = 'idle';
   private lastError = '';
-  /** proxy 报的浏览器名，没有时为配置里的那个。 */
+  /** 连上的浏览器名（`/json/version` 报的，例如 `Chrome/138…`），没有时为配置里的那个。 */
   private browserLabel = '';
   /** 自己开的页面：targetId → 最后一次用到它的时刻。只有这些允许关，也只有这些会被闲置回收。 */
   private readonly mine = new Map<string, number>();
@@ -424,7 +421,7 @@ export class BrowserWorld implements World {
    */
   private readonly seen = new Map<string, SeenPage>();
   private seenAt = 0;
-  /** proxy 掉了之后补拉过一次就不再试了。 */
+  /** 连不上时补拉过一次就不再补了（专属实例那一路）；纯重连不算补拉，每次工具调用都试。 */
   private recoveryTried = false;
 
   private readonly searchService: BrowserSearchService;
@@ -440,13 +437,11 @@ export class BrowserWorld implements World {
           cdpPort: cfg.ownBrowserPort,
         })
       : null;
-    this.relay = new CdpRelay({
-      skillDir: cfg.skillDir.trim(),
+    // 专属实例那一路：端口是我们自己定的，引擎直连，不走发现。
+    this.engine = new CdpEngine({
       browser: cfg.browser.trim(),
-      port: cfg.port,
+      ...(this.own ? { fixedPort: cfg.ownBrowserPort } : {}),
       tabIdleMinutes: cfg.tabIdleMinutes,
-      // 专属实例那一路：把"家"当 LOCALAPPDATA 交给 proxy，上游据此发现她那个实例。
-      localAppDataRoot: this.own ? cfg.ownBrowserHome.trim() : undefined,
     });
     this.video = new BilibiliSession({
       cfg: cfg.video, timezone: opts.timezone,
@@ -460,8 +455,8 @@ export class BrowserWorld implements World {
       } : undefined,
       close: async target => {
         if (!this.mine.has(target)) throw new Error('这个页面不是 Browser 开的，请手动关闭；已经停止观看。');
-        await this.relay.close(target, this.timeout());
-        this.mine.delete(target); this.directPages.delete(target); this.seen.delete(target);
+        await this.engine.close(target, this.timeout());
+        this.mine.delete(target); this.seen.delete(target);
       },
     });
   }
@@ -495,7 +490,7 @@ export class BrowserWorld implements World {
         ...(this.own
           ? [{ label: '她的浏览器', value: `127.0.0.1:${cfg.ownBrowserPort}`, tone: 'plain' as const }]
           : []),
-        { label: 'proxy', value: `127.0.0.1:${cfg.port}`, tone: 'plain' },
+        { label: '调试口', value: this.engine.browserPort > 0 ? `127.0.0.1:${this.engine.browserPort}` : '未连接', tone: 'plain' },
         { label: '她开的页', value: this.mine.size, tone: 'plain' },
       ],
       config: [BROWSER_CONFIG_GROUP, ...(search.config ?? []), ...(video.config ?? [])],
@@ -528,7 +523,7 @@ export class BrowserWorld implements World {
     if (this.opts.cfg.video.enabled) await this.video.start(host);
     const log = host.log.child(this.id);
     try {
-      // 配了专属实例：先保证它在跑，并把发现文件写出来——上游的 proxy 就是靠那个文件认出它的。
+      // 配了专属实例：先保证它在跑。它由本 World 起停，起不来在这里说清配哪里错了。
       if (this.own) {
         const ownProblem = await this.own.ensure(log, this.opts.cfg.readyTimeoutMs);
         if (ownProblem) {
@@ -543,67 +538,21 @@ export class BrowserWorld implements World {
         }
       }
 
-      const health = await this.relay.probe();
-      if (health) {
-        this.browserLabel = health.browserLabel || health.browserId;
-        if (await this.relay.reachable()) {
-          const wrongTarget = await this.ownTargetProblem(health);
-          if (wrongTarget) {
-            this.state = 'failed';
-            this.lastError = wrongTarget;
-            log.warn('proxy 连的不是她那个实例', { error: wrongTarget });
-            await this.emit('browser.down', `浏览器不可用：${wrongTarget}`);
-            return;
-          }
-          this.state = 'ready';
-          log.info('复用已在运行的 cdp-proxy', { endpoint: this.relay.endpoint(), browser: this.browserLabel });
-          await this.emit(
-            'browser.ready',
-            `浏览器已就绪（复用了已在运行的 proxy，${this.relay.endpoint()}，${this.browserLabel || '浏览器未识别'}）。`,
-          );
-          return;
-        }
-        // 端口上已经有 proxy 了，但浏览器没接上。不再拉起一个去抢端口。
+      const problem = await this.engine.connect(log, this.opts.cfg.readyTimeoutMs);
+      if (problem) {
         this.state = 'failed';
-        this.lastError = '已经有一个 proxy 在跑，但它没连上浏览器';
-        log.warn('复用的 proxy 没连上浏览器');
-        await this.emit('browser.down', `浏览器不可用：${this.lastError}。${this.connectHint()}`);
+        this.lastError = problem;
+        log.warn('浏览器没能连上', { error: problem });
+        await this.emit('browser.down', `浏览器不可用：${problem}。${this.connectHint()}`);
         return;
       }
-
-      this.state = 'starting';
-      const portProblem = await this.relay.checkPort();
-      if (portProblem) {
-        this.state = 'failed';
-        this.lastError = portProblem;
-        log.warn('这个端口用不了，不拉了', { error: portProblem });
-        await this.emit('browser.down', `浏览器起不来：${portProblem}${this.connectHint()}`);
-        return;
-      }
-      if (!this.relay.spawnProxy(log)) {
-        this.state = 'failed';
-        this.lastError = this.relay.failure;
-        await this.emit('browser.down', `浏览器起不来：${this.lastError}。${this.connectHint()}`);
-        return;
-      }
-      if (!(await this.waitReady(this.opts.cfg.readyTimeoutMs))) {
-        this.state = 'failed';
-        this.lastError = this.relay.failure || '等它连上浏览器超时';
-        log.warn('cdp-proxy 没能连上浏览器', { error: this.lastError });
-        await this.emit('browser.down', `浏览器没能就绪：${this.lastError}。${this.connectHint()}`);
-        return;
-      }
-      const wrongTarget = await this.ownTargetProblem();
-      if (wrongTarget) {
-        this.state = 'failed';
-        this.lastError = wrongTarget;
-        log.warn('proxy 连的不是她那个实例', { error: wrongTarget });
-        await this.emit('browser.down', `浏览器不可用：${wrongTarget}`);
-        return;
-      }
+      this.browserLabel = this.engine.browserLabel;
       this.state = 'ready';
-      log.info('浏览器已就绪', { endpoint: this.relay.endpoint(), browser: this.browserLabel });
-      await this.emit('browser.ready', `浏览器已就绪（${this.relay.endpoint()}，${this.browserLabel || displayBrowser(this.opts.cfg.browser)}）。`);
+      log.info('浏览器已就绪', { port: this.engine.browserPort, browser: this.browserLabel });
+      await this.emit(
+        'browser.ready',
+        `浏览器已就绪（${this.browserLabel || displayBrowser(this.opts.cfg.browser)} · 调试口 127.0.0.1:${this.engine.browserPort}）。`,
+      );
     } catch (err) {
       this.state = 'failed';
       this.lastError = describe(err);
@@ -615,7 +564,7 @@ export class BrowserWorld implements World {
     this.searchService.stop();
     this.running = false;
     await this.video.stop();
-    await this.relay.stop(); // 只关自己拉起的那个
+    await this.engine.stop(); // 顺手关掉引擎建出来的那批页面；操作员与她的窗口不受影响
     this.own?.stop(); // 同理：复用的那个实例不动它
     this.state = 'idle';
     this.host = null;
@@ -624,41 +573,7 @@ export class BrowserWorld implements World {
     this.recoveryTried = false;
   }
 
-  /**
-   * 配了专属实例时，核对 proxy 连的**确实是那个实例**。
-   *
-   * 会走神的情形：他刚把 `ownBrowser` 打开，而端口上还挂着一个老的 proxy（连着他日常那个 Edge）。
-   * 那种情况下这个 World 会静默地去操作他的浏览器——正是我们想离开的东西，必须当场说清。
-   * 拿不到 `/health` 时不算这里的问题：工具那条路自己会报。
-   */
-  private async ownTargetProblem(health?: RelayHealth | null): Promise<string | null> {
-    if (!this.own) return null;
-    const info = health ?? (await this.relay.probe());
-    if (!info) return null;
-    if (info.chromePort > 0 && info.chromePort !== this.opts.cfg.ownBrowserPort) {
-      const who = info.browserLabel || info.browserId || '未识别';
-      const flag = info.browserId ? `--browser ${info.browserId}` : '--browser …';
-      return (
-        `proxy 连的是端口 ${info.chromePort} 上的浏览器（${who}），不是她自己的那个（${this.opts.cfg.ownBrowserPort}）。` +
-        `多半是端口 ${this.opts.cfg.port} 上还挂着一个上一次运行留下的 cdp-proxy（它的命令行里带 \`${flag}\`）：` +
-        '把那个 node 进程停掉就行——停掉之后这个 World 下次工具调用会自己把 proxy 补拉回来，不必再重启。' +
-        '（如果那是操作员或他的 coding agent 自己起的 proxy，就别动它：把 worlds.browser.port 换一个。）'
-      );
-    }
-    return null;
-  }
-
   // ——— 状态与轮询 ———
-
-  private async waitReady(timeoutMs: number): Promise<boolean> {
-    const deadline = Date.now() + Math.max(1000, timeoutMs);
-    while (Date.now() < deadline) {
-      if (await this.relay.reachable(READY_POLL_MS * 2)) return true;
-      if (!this.running) return false;
-      await sleep(READY_POLL_MS);
-    }
-    return false;
-  }
 
   /**
    * 与她上次问的时候比：他新开了、转到、关掉了哪些页面。
@@ -690,35 +605,17 @@ export class BrowserWorld implements World {
     return { changes, sinceMs };
   }
 
-  /** proxy 死了不会自己回来，而没有定时器在替我们看着。整场只补拉一次。 */
-  private async tryRelaunch(): Promise<void> {
-    const host = this.host;
-    if (!host || this.recoveryTried || this.relay.owned || !this.opts.cfg.skillDir.trim()) return;
-    this.recoveryTried = true;
-    const log = host.log.child(this.id);
-    const portProblem = await this.relay.checkPort();
-    if (portProblem) {
-      log.warn('端口用不了，不补拉了', { error: portProblem });
-      return;
-    }
-    log.info('proxy 不在了，补拉一次');
-    if (!this.relay.spawnProxy(log)) return;
-    // 这是在一次工具调用里等，别把调用本身拖到超时。
-    if (!(await this.waitReady(Math.min(4000, this.opts.cfg.readyTimeoutMs)))) {
-      log.warn('补拉的 proxy 也没能连上浏览器');
-    }
-  }
-
   private lamp(): WorldLamp {
+    const port = this.engine.browserPort > 0 ? ` · 调试口 127.0.0.1:${this.engine.browserPort}` : '';
     switch (this.state) {
       case 'ready':
-        return { label: '浏览器', state: 'online', hint: `${this.browserLabel || displayBrowser(this.opts.cfg.browser)} · ${this.relay.endpoint()}` };
+        return { label: '浏览器', state: 'online', hint: `${this.browserLabel || displayBrowser(this.opts.cfg.browser)}${port}` };
       case 'starting':
-        return { label: '浏览器', state: 'loading', hint: `${this.relay.endpoint()} · 等它连上浏览器` };
+        return { label: '浏览器', state: 'loading', hint: '等它连上浏览器' };
       case 'failed':
         return { label: '浏览器', state: 'error', hint: this.lastError || '连不上浏览器' };
       default:
-        return { label: '浏览器', state: 'offline', hint: `${this.relay.endpoint()} · 未启动` };
+        return { label: '浏览器', state: 'offline', hint: '未启动' };
     }
   }
 
@@ -740,9 +637,6 @@ export class BrowserWorld implements World {
   }
 
   private connectHint(): string {
-    if (/端口/.test(this.lastError)) {
-      return '（换一个没被占用的 worlds.browser.port：Windows 保留的端口段会报 EACCES。）';
-    }
     if (this.own) {
       return (
         '（这是她自己那个实例，不是操作员日常的浏览器：看 ownBrowserExe / ownBrowserHome 配得对不对，' +
@@ -774,9 +668,9 @@ export class BrowserWorld implements World {
   /**
    * 专属模式下开页：建**一个她自己的窗口**装这一页（不激活、屏幕外）。
    *
-   * 为什么不用上游的 `/new`：它建的是后台 tab，而量到过——后台 tab 里页面是 `hidden`、媒体**根本不加载**。
+   * 为什么不直接用引擎的 `openBlank`（后台 tab）：量到过——后台 tab 里页面是 `hidden`、媒体**根本不加载**。
    * 页面在一个自己窗口里就足以让它是 `visible`、媒体照播，而且不抬窗口、不抢焦点。
-   * 建不成时退回 `/new`（她仍然能读页，只是媒体播不了），并在回执里说明——别让一次失败变成没手可用。
+   * 建不成时退回后台 tab（她仍然能读页，只是媒体播不了），并在回执里说明——别让一次失败变成没手可用。
    */
   private async newPage(
     url: string,
@@ -788,64 +682,56 @@ export class BrowserWorld implements World {
         const { targetId } = await createWindow(this.opts.cfg.ownBrowserPort, url, Math.min(timeoutMs, 5000));
         return { targetId, note: '' };
       } catch (err) {
-        const targetId = await this.relay.openBlank(timeoutMs, ctx.signal);
+        const targetId = await this.engine.openBlank(timeoutMs);
         return {
           targetId,
           note: `（这次没能给她开独立窗口：${describe(err)}。退回了后台 tab —— 页面能读，但**媒体播不了**。）`,
         };
       }
     }
-    return { targetId: await this.relay.openBlank(timeoutMs, ctx.signal), note: '' };
+    return { targetId: await this.engine.openBlank(timeoutMs), note: '' };
   }
 
-  /** 任何带 `target` 的调用都记一笔"刚用过"，闲置回收靠这个时间戳。 */
+  /** 给视频模块领一个页面：要么核验它点名的那个 target，要么建一个 about:blank 的窗口。 */
   private async acquireVideoPage(requested?: string): Promise<{targetId: string; browserURL: string}> {
     const problem = await this.ensureReady();
     if (problem) throw new Error(problem);
-    const health = await this.relay.probe();
-    const port = health?.chromePort;
-    if (!port || (this.own && port !== this.opts.cfg.ownBrowserPort)) throw new Error('proxy 未提供可核验的浏览器调试端口');
+    const port = this.engine.browserPort;
+    if (!port || (this.own && port !== this.opts.cfg.ownBrowserPort)) throw new Error('没有可核验的浏览器调试端口');
     let targetId = requested;
     if (targetId) {
-      const page = (await this.relay.targets(this.timeout())).find(p => p.targetId === targetId);
+      const page = (await this.engine.targets(this.timeout())).find(p => p.targetId === targetId);
       if (!page || !isBilibili(page.url)) throw new Error('指定 target 不存在或不是 B 站页面');
     } else {
       const created = await createWindow(port, 'about:blank', this.timeout());
       targetId = created.targetId;
       this.mine.set(targetId, Date.now());
-      this.directPages.add(targetId);
     }
     return {targetId, browserURL: 'http://127.0.0.1:' + port};
   }
 
   private touch(targetId: string): void {
     if (!this.mine.has(targetId)) return;
-    const now = Date.now();
-    this.mine.set(targetId, now);
-    // Borrowed-browser pages created by the proxy have a second idle clock there.
-    if (!this.own && !this.directPages.has(targetId) && now - (this.proxyTouchedAt.get(targetId) ?? 0) >= 30_000) {
-      this.proxyTouchedAt.set(targetId, now);
-      void this.relay.info(targetId, 5000).catch(() => {});
-    }
+    this.mine.set(targetId, Date.now());
+    // 引擎建出来的那批页面（后台 tab）另有一本闲置账（引擎的定时回收），在这里一起刷。
+    this.engine.touch(targetId);
   }
 
   /**
-   * 闲置回收：自己开的页面闲置超过 `tabIdleMinutes` 就关掉。
+   * 闲置回收：她开的页面闲置超过 `tabIdleMinutes` 就关掉。
    *
-   * 借他那个浏览器时这件事是上游 proxy 干的（它的 `managedTabs` + 每分钟扫一次）。但她的窗口是
-   * **我们直连 CDP 建的**，上游不认识它们——不自己收就会一直堆着，所以这里补一份。
-   * 走的是"每次工具调用顺便扫一眼"，不挂定时器（与这个 World「不定时看任何东西」一致）。
+   * 引擎那边还有一个 60 秒一扫的定时器管它自己建出来的后台 tab（与当年 proxy 的行为一致）；
+   * 这里这份是「每次工具调用顺便扫一眼」，不挂定时器——与这个 World「不定时看任何东西」一致。
+   * 两边的时间戳都是 `touch()` 在刷，口径相同；关的是同一批页面，谁先到谁关。
    */
   private sweepIdle(): void {
     const limit = Math.max(1, Math.round(this.opts.cfg.tabIdleMinutes * 60_000));
     const now = Date.now();
     for (const [target, usedAt] of [...this.mine]) {
-      if (!this.own && !this.directPages.has(target)) continue;
       if (this.video.protects(target) || now - usedAt < limit) continue;
       this.mine.delete(target);
-      this.directPages.delete(target);
       this.seen.delete(target);
-      void this.video.mutateTarget(target, () => this.relay.close(target, 5000)).catch(() => {
+      void this.video.mutateTarget(target, () => this.engine.close(target, 5000)).catch(() => {
         // 关不成就算了：下次调用还会再试一遍
       });
     }
@@ -861,33 +747,40 @@ export class BrowserWorld implements World {
   }
 
   /**
-   * 工具调用前的现查：状态可能是陈旧的，先探一次；还是不通就顺手补拉一次 proxy，
-   * 再不通才报不可用。没有定时器在替她看着，所以补拉挂在这一条路上。
+   * 工具调用前的现查：状态可能是陈旧的，先看引擎连没连；没连就重连一次。
    *
-   * **每一次转成 ready 都要过 `ownTargetProblem()`**（不只是 `start()` 那一次）：端口上挂着一个
-   * 连别处的旧 proxy 时，它是**活的**，`/targets` 答得出来——只探活不看连的是谁，就会把它当成就绪，
-   * 然后静默地去操作操作员的浏览器。这正是要防的那件事。
+   * 连接是无状态的：断了对下一次调用重连即可，浏览器关了重开也不碍事（发现缓存会清）。
+   * 唯一带记忆的是**专属实例的补拉**——她整个没了的时候，整场只补拉一次（与当年补拉 proxy
+   * 的口径一致），免得浏览器起不来时每次调用都去 spawn 一遍。
    */
   private async ensureReady(): Promise<string | null> {
-    this.sweepIdle(); // 顺手把她闲置的窗口收掉（不挂定时器）；注意要在"已就绪就早退"之前
-    if (this.state === 'ready') return null;
-    const settle = async (): Promise<string | null> => {
-      const wrong = await this.ownTargetProblem();
-      if (wrong) {
-        this.state = 'failed';
-        this.lastError = wrong;
-        return `浏览器不可用：${wrong}`;
-      }
+    this.sweepIdle(); // 顺手把她闲置的页面收掉（不挂定时器）；注意要在"已就绪就早退"之前
+    if (this.state === 'ready' && this.engine.connected) return null;
+    const settle = (): string | null => {
       this.state = 'ready';
       this.lastError = '';
+      if (this.engine.browserLabel) this.browserLabel = this.engine.browserLabel;
       return null;
     };
-    if (await this.relay.reachable(this.timeout())) return settle();
-    await this.tryRelaunch();
-    if (await this.relay.reachable(this.timeout())) return settle();
-    const port = this.relay.endpoint();
-    const reason = this.lastError || this.relay.failure || '没连上浏览器';
-    return `浏览器不可用（${port}）：${reason}。${this.connectHint()}`;
+    if (this.engine.connected) return settle();
+    const log = this.host?.log.child(this.id);
+    if (!this.recoveryTried) {
+      this.recoveryTried = true;
+      if (this.own && log) {
+        // 这是在一次工具调用里等，别把调用本身拖到超时。
+        const problem = await this.own.ensure(log, Math.min(4000, this.opts.cfg.readyTimeoutMs));
+        if (problem) {
+          this.state = 'failed';
+          this.lastError = problem;
+          return `浏览器不可用：${problem}${this.connectHint()}`;
+        }
+      }
+    }
+    const problem = await this.engine.connect(log ?? null, Math.min(this.timeout(), 8000));
+    if (!problem) return settle();
+    this.state = 'failed';
+    this.lastError = problem;
+    return `浏览器不可用：${problem}。${this.connectHint()}`;
   }
 
   // ——— 工具 ———
@@ -910,8 +803,8 @@ export class BrowserWorld implements World {
       this.closeTool(),
       this.findUrlTool(),
     ];
-    // 一处挂钩：任何带 target 的调用都算"刚用过这个页面"。闲置回收（sweepIdle）靠这个时间戳，
-    // 因为她的窗口是我们直连 CDP 建的、上游 proxy 不认识它们。
+    // 一处挂钩：任何带 target 的调用都算"刚用过这个页面"。闲置回收（sweepIdle 与引擎的定时器）
+    // 都靠这个时间戳。
     if (this.opts.cfg.video.enabled) defs.push(...this.video.tools());
     return defs.map((def) => ({
       ...def,
@@ -1022,10 +915,10 @@ export class BrowserWorld implements World {
     }
     this.mine.set(targetId, Date.now());
 
-    // ② 再单独导航。这一段走 navTimeout()，比普通调用宽：站点打不通时上游要等它自己的 30 秒
-    //    CDP 超时才回话，客户端卡在 30 秒上只会把真话挡在外面。
+    // ② 再单独导航。这一段走 navTimeout()，比普通调用宽：慢站点上把导航卡在普通超时里，
+    //    回执只能说「没等到」；宽出来这一截是让引擎把加载等到位、或把真实的失败带回来。
     try {
-      await this.relay.navigate(targetId, withScheme(raw), this.navTimeout(), ctx.signal);
+      await this.engine.navigate(targetId, withScheme(raw), this.navTimeout());
     } catch (err) {
       const told = this.explain(err, '导航', 'nav');
       const page = await this.dump(targetId, null, OPEN_TEXT_MAX, ctx, NAV_FAILED_DUMP_MS);
@@ -1072,7 +965,7 @@ export class BrowserWorld implements World {
     this.mine.set(targetId, Date.now());
 
     try {
-      await this.relay.navigate(targetId, searchUrl(engine, query), this.navTimeout(), ctx.signal);
+      await this.engine.navigate(targetId, searchUrl(engine, query), this.navTimeout());
     } catch (err) {
       return fail(
         `${this.explain(err, '打开搜索结果页', 'nav')}\n` +
@@ -1082,7 +975,7 @@ export class BrowserWorld implements World {
 
     let harvested: unknown = null;
     try {
-      const result = await this.relay.evaluate(targetId, searchExpression(engine, count), this.timeout(), ctx.signal);
+      const result = await this.engine.evaluate(targetId, searchExpression(engine, count), this.timeout());
       harvested = result.ok ? result.value : null;
     } catch {
       // 抽取这一发没回话不算失败：下面会退回整页正文。
@@ -1134,7 +1027,7 @@ export class BrowserWorld implements World {
 
     let result: EvalResult;
     try {
-      result = await this.relay.evaluate(target, expression, this.timeout(), ctx.signal);
+      result = await this.engine.evaluate(target, expression, this.timeout());
     } catch (err) {
       return fail(this.explain(err, 'eval'));
     }
@@ -1154,10 +1047,10 @@ export class BrowserWorld implements World {
     // 点之前先记一眼页面表。结果页上的链接是 `target=_blank`，点下去新页面开在**别处**，
     // 而这个回执从前只说原页面「点击后此刻」——开出来那张她既看不见、也关不掉（不在她的页面表里）。
     // 2026-10-12 量到：JS 点击开不出新页，真鼠标那一下会开出来。
-    const before = await this.relay.targets(this.timeout()).catch(() => null);
+    const before = await this.engine.targets(this.timeout()).catch(() => null);
     try {
-      const clicked = await this.relay.click(target, selector, native, this.timeout(), ctx.signal);
-      const info = await this.relay.info(target, this.timeout(), ctx.signal).catch(() => null);
+      const clicked = await this.engine.click(target, selector, native, this.timeout());
+      const info = await this.engine.info(target, this.timeout()).catch(() => null);
       const head = `已点击 ${native ? '（真实鼠标）' : ''}：${clicked.tag}${clicked.text ? ` 「${truncate(clicked.text, 80)}」` : ''}`;
       const tail = info ? `点击后此刻：${info.title || '(无标题)'} · ${info.url}（${info.ready}）` : null;
       const opened = await this.openedByClick(before);
@@ -1175,7 +1068,7 @@ export class BrowserWorld implements World {
    */
   private async openedByClick(before: readonly PageTarget[] | null): Promise<string[]> {
     if (!before) return [];
-    const after = await this.relay.targets(this.timeout()).catch(() => null);
+    const after = await this.engine.targets(this.timeout()).catch(() => null);
     if (!after) return [];
     const known = new Set(before.map((page) => page.targetId));
     const fresh = after.filter((page) => !known.has(page.targetId) && !INTERNAL_URL.test(page.url));
@@ -1206,11 +1099,10 @@ export class BrowserWorld implements World {
 
     let result: EvalResult;
     try {
-      result = await this.relay.evaluate(
+      result = await this.engine.evaluate(
         target,
         typeExpression(selector, value, args.submit === true),
         this.timeout(),
-        ctx.signal,
       );
     } catch (err) {
       return fail(this.explain(err, 'type'));
@@ -1237,7 +1129,7 @@ export class BrowserWorld implements World {
     if (notReady) return fail(notReady);
 
     try {
-      const count = await this.relay.setFiles(target, selector, files, this.timeout(), ctx.signal);
+      const count = await this.engine.setFiles(target, selector, files, this.timeout());
       return { text: `已给 ${selector} 挂上 ${count} 个文件：${files.join('、')}` };
     } catch (err) {
       return fail(this.explain(err, 'upload'));
@@ -1253,7 +1145,7 @@ export class BrowserWorld implements World {
     const to = ['down', 'up', 'top', 'bottom'].includes(str(args.to)) ? str(args.to) : 'down';
     const y = clampInt(args.y, 3000, 0, 1_000_000);
     try {
-      const said = await this.relay.scroll(target, { direction: to, y }, this.timeout(), ctx.signal);
+      const said = await this.engine.scroll(target, { direction: to, y }, this.timeout());
       return { text: said || `已滚动（${to}）` };
     } catch (err) {
       return fail(this.explain(err, 'scroll'));
@@ -1267,8 +1159,8 @@ export class BrowserWorld implements World {
     if (notReady) return fail(notReady);
 
     try {
-      const bytes = await this.relay.screenshot(target, this.timeout(), ctx.signal);
-      const info = await this.relay.info(target, this.timeout(), ctx.signal).catch(() => null);
+      const bytes = await this.engine.screenshot(target, this.timeout());
+      const info = await this.engine.info(target, this.timeout()).catch(() => null);
       const where = info ? `${info.title || '(无标题)'} · ${info.url}` : `target ${target}`;
       return {
         text: `截图：${where}\n这是视口那一屏，不是整页；要看更下面的内容先 browser_scroll。`,
@@ -1296,9 +1188,9 @@ export class BrowserWorld implements World {
     if (notReady) return fail(notReady);
 
     try {
-      if (back) await this.relay.back(target, this.navTimeout(), ctx.signal);
-      else await this.relay.navigate(target, withScheme(url), this.navTimeout(), ctx.signal);
-      const info = await this.relay.info(target, this.timeout(), ctx.signal).catch(() => null);
+      if (back) await this.engine.back(target, this.navTimeout());
+      else await this.engine.navigate(target, withScheme(url), this.navTimeout());
+      const info = await this.engine.info(target, this.timeout()).catch(() => null);
       const where = info ? `${info.title || '(无标题)'} · ${info.url}（${info.ready}）` : '页面已响应';
       return { text: `${back ? '已后退' : '已导航'}：${where}` };
     } catch (err) {
@@ -1311,7 +1203,7 @@ export class BrowserWorld implements World {
     if (notReady) return fail(notReady);
     let targets: PageTarget[];
     try {
-      targets = await this.relay.targets(this.timeout());
+      targets = await this.engine.targets(this.timeout());
     } catch (err) {
       return fail(this.explain(err, 'tabs'));
     }
@@ -1349,7 +1241,7 @@ export class BrowserWorld implements World {
     if (notReady) return fail(notReady);
 
     try {
-      await this.relay.close(target, this.timeout(), ctx.signal);
+      await this.engine.close(target, this.timeout());
     } catch (err) {
       return fail(this.explain(err, 'close'));
     }
@@ -1386,30 +1278,24 @@ export class BrowserWorld implements World {
   }
 
   private async findUrl(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {
-    const skillDir = this.opts.cfg.skillDir.trim();
-    if (!skillDir) return fail('worlds.browser.skillDir 没配：找不到 find-url.mjs。');
-    if (!existsSync(join(skillDir, 'scripts', 'find-url.mjs'))) {
-      return fail(`${skillDir}\\scripts 里没有 find-url.mjs：这个工具要 web-access 2.5.0 起才带。`);
-    }
-    const argv: string[] = [];
-    if (Array.isArray(args.keywords)) {
-      for (const word of args.keywords) {
-        if (typeof word === 'string' && word.trim() !== '') argv.push(word.trim());
-      }
-    }
-    const only = str(args.only);
-    if (only === 'bookmarks' || only === 'history') argv.push('--only', only);
-    const browser = str(args.browser);
-    if (browser === 'chrome' || browser === 'edge') argv.push('--browser', browser);
-    if (typeof args.limit === 'number' && Number.isFinite(args.limit)) argv.push('--limit', String(Math.round(args.limit)));
-    const since = str(args.since);
-    if (since) argv.push('--since', since);
-    const sort = str(args.sort);
-    if (sort === 'recent' || sort === 'visits') argv.push('--sort', sort);
-
-    // 这个脚本要看他的书签库与历史库，跟页面无关，所以不走 proxy 的请求超时。
+    // 这个工具要看本机的书签库与历史库，跟页面无关，所以不走引擎的调用超时。
     ctx.signal?.throwIfAborted();
-    const result = await runFindUrl(skillDir, argv, FIND_URL_TIMEOUT_MS);
+    const result = await findUrl(
+      {
+        keywords: Array.isArray(args.keywords)
+          ? args.keywords.filter((word): word is string => typeof word === 'string')
+          : [],
+        only: str(args.only) === 'bookmarks' || str(args.only) === 'history' ? (str(args.only) as 'bookmarks' | 'history') : undefined,
+        browser: str(args.browser) === 'chrome' || str(args.browser) === 'edge' ? (str(args.browser) as 'chrome' | 'edge') : undefined,
+        limit: typeof args.limit === 'number' && Number.isFinite(args.limit) ? Math.round(args.limit) : undefined,
+        since: str(args.since) || undefined,
+        sort: str(args.sort) === 'visits' || str(args.sort) === 'recent' ? (str(args.sort) as 'recent' | 'visits') : undefined,
+      },
+      // 专属实例模式：查的是她自己那个 profile（Chrome 布局，在她的"家"下面）。
+      { ownHome: this.own ? this.opts.cfg.ownBrowserHome.trim() : undefined },
+      FIND_URL_TIMEOUT_MS,
+      ctx.signal,
+    );
     if (!result.ok) return fail(`书签历史检索没成功：\n${truncate(result.output, 2000)}`);
     return { text: result.output.trim() || '没有匹配的书签或历史记录。' };
   }
@@ -1426,7 +1312,7 @@ export class BrowserWorld implements World {
   ): Promise<{ ok: true; page: PageDump } | { ok: false; text: string }> {
     let result: EvalResult;
     try {
-      result = await this.relay.evaluate(target, readExpression(selector, maxChars), timeoutMs, ctx.signal);
+      result = await this.engine.evaluate(target, readExpression(selector, maxChars), timeoutMs);
     } catch (err) {
       return { ok: false, text: this.explain(err, 'read') };
     }
@@ -1452,11 +1338,11 @@ export class BrowserWorld implements World {
    *
    * 教训（2026-09-30）：那段「去开远程调试」原先无条件贴（`status === 0` 就贴），于是「站点打不开」
    * 被念成「浏览器没连上」——bot 照着自己手里 `browser_tabs` 列得出 25 个页面这一点就矛盾了。
-   * 现在只有「连不上 proxy」与「proxy 说浏览器没连上」才贴它；导航那一段（`step: 'nav'`）另有说法。
+   * 现在只有「连不上浏览器」与「浏览器没连上」才贴它；导航那一段（`step: 'nav'`）另有说法。
    */
   private explain(err: unknown, what: string, step: 'plain' | 'nav' = 'plain'): string {
-    if (!(err instanceof RelayError)) return `${what} 没成功：${describe(err)}`;
-    const kind: RelayFailureKind | 'nav' = step === 'nav' ? 'nav' : classifyRelayError(err);
+    if (!(err instanceof EngineError)) return `${what} 没成功：${describe(err)}`;
+    const kind: EngineFailureKind | 'nav' = step === 'nav' ? 'nav' : classifyEngineError(err);
     const tail =
       kind === 'unreachable' || kind === 'not-connected'
         ? ` ${this.connectHint()}`

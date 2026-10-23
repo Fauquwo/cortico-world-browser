@@ -1,12 +1,13 @@
 # cortico-world-browser
 
-> **★ 非即插即用。** 装完包还不能用：先装上游 [web-access](https://github.com/eze-is/web-access)，
-> 把目录填进 `worlds.browser.skillDir`；再填 `worlds.browser.browser`，并打开那个浏览器的远程调试开关。
-> 缺一样 `preflight` 就会拦住 World，时间线里不会出现 `browser.ready`。步骤见下面「怎么装」。
+> **0.4.0 起装完包就是全部**：浏览器引擎在包内，直接对浏览器的调试口说 CDP，不再需要安装任何上游项目。
+> 唯一的"外部"是浏览器本身——借操作员日常那个浏览器时，要先在浏览器里打开远程调试开关
+> （这是浏览器自己的安全开关，任何包都替你开不了）；给她配专属实例则零配置。
+> 步骤见下面「怎么装」。
 
 Owner: `src/definition.ts`
 
-把本机 [web-access](https://github.com/eze-is/web-access) 的 CDP proxy 接成一个 World：
+把本机浏览器的调试口（Chromium 的 CDP）接成一个 World：
 bot 能在浏览器里搜索、开页、读页、点击、填表、上传、滚动、截图，能查本机的书签与历史，
 接的是操作员日常那个浏览器时还能自己看一眼他在干什么（拉取式，见下面的「事件」）。
 
@@ -22,19 +23,19 @@ bot 能在浏览器里搜索、开页、读页、点击、填表、上传、滚�
 ## 在 Coopanion(Coo)上使用
 
 已在 **Coopanion 0.2.5**(Windows x64 便携版)上装机验收:市场里检查与安装成功,重启后**导入成功**;
-搜索面板与 B 站播放面板都能打开,设置页显示搜索配置;专属 Chrome 与 cdp-proxy 在线;
+搜索面板与 B 站播放面板都能打开,设置页显示搜索配置;专属 Chrome 与引擎连接在线;
 六个工具在真实浏览器上依次走通(打开、输入、点击、读回、看标签、关闭),读回了本地测试页里提交的内容;
 真模型也跑过一轮(模型自己 `browser_open` 读页面 → 用别的工具干活 → `browser_close`)。
 这一次没有测 B 站扫码登录与视频播放,也没测 DeepSeek / Tavily 这类付费搜索 API(要账号与密钥)。
-「非即插即用」那一条在 Coo 上同样成立:web-access、`skillDir`、浏览器远程调试三样都要自己配,
-Coopanion 不会代劳。
+借操作员的浏览器时,"开远程调试开关"这一步在 Coo 上同样要自己动手,Coopanion 不会代劳;
+专属实例模式没有这一步。
 
 Coo 的扩展市场默认可能走镜像源(npmmirror),镜像上偶尔还没有新版本 —— 检查时报「registry 没有给出
 cortico-world-browser 的 x.y.z 版本」,就把 Coo 的扩展源改成官方 `https://registry.npmjs.org` 再装。
 装完或改过配置要**整进程重启** Coo 才生效(只重启 World 不够,端口与 profile 会按旧值走)。
 
 **遇到问题**:去 GitHub 开 issue —— https://github.com/biliye/cortico-world-browser/issues;
-或者到 QQ 群里 @筆離嘢(和作者名同名)。附上 Coo 版本、本包版本和报错截图,再说清是「连不上 proxy」
+或者到 QQ 群里 @筆離嘢(和作者名同名)。附上 Coo 版本、本包版本和报错截图,再说清是「连不上浏览器」
 「浏览器没连上」还是「页面没打开」那一类 —— 回执里会写明,照着贴就行。
 
 ## 市场标签
@@ -44,7 +45,7 @@ cortico-world-browser 的 x.y.z 版本」,就把 Coo 的扩展源改成官方 `h
 - **`internet`**：搜索、抓取正文、读网页 —— 词表里「让 bot 读取或操作互联网内容」；
 - **`browser`**：真正操作一个浏览器（开页、点击、填表、截图），不是只调 HTTP 接口；
 - **`video`**：陪看 B 站视频、读字幕与弹幕；
-- **`external-setup`**：装完包还不够，要先装上游 [web-access](https://github.com/eze-is/web-access) 并配好远程调试；
+- **`external-setup`**：借操作员的浏览器时，要先在那个浏览器里打开远程调试开关（专属实例模式不用）；
 - **`high-cost`**（提示级）：观看视频时每 15 秒投一张画面拼图，还会读字幕与弹幕，token 消耗比普通工具快。
 
 没有声明警示标签：它不持续读取屏幕或键鼠，截图与页面内容只在工具被调用时产生。卡片图标是包内
@@ -61,8 +62,8 @@ cortico-world-browser 的 x.y.z 版本」,就把 Coo 的扩展源改成官方 `h
 
 装完还要做两件事，否则 `preflight` 会拦住 World：
 
-1. 装上游 web-access，把目录填进 `worlds.browser.skillDir`；
-2. 填 `worlds.browser.browser`（`chrome` / `edge` / `chromium`），并按下一节打开对应浏览器的远程调试开关。
+1. 填 `worlds.browser.browser`（`chrome` / `edge` / `chromium`），必须是你要操作的那一个；
+2. 按下一节打开那个浏览器的远程调试开关（**专属实例模式跳过这一步**）。
 
 然后启用 `worlds.browser`，时间线应出现 `browser.ready`；Browser 详情页出现「搜索设置」与「B 站授权」面板。
 
@@ -77,23 +78,26 @@ cortico-world-browser 的 x.y.z 版本」,就把 Coo 的扩展源改成官方 `h
 | `src/definition.ts` | `WorldDefinition`：id、label、默认配置段、`preflight` |
 | `src/config.ts` | 配置段类型、默认值、控制台配置组 |
 | `src/world.ts` | `World` 实现：起停、通用与视频工具、`webUi()` |
-| `src/cdp-client.ts` | cdp-proxy 的客户端：起停子进程、HTTP 调用、`find-url.mjs` |
+| `src/cdp-engine.ts` | 包内的 CDP 引擎：浏览器级 WebSocket、扁平会话、端口防探测、闲置回收 |
+| `src/browser-discovery.ts` | 借操作员的浏览器时发现调试口（`DevToolsActivePort`，严格匹配） |
+| `src/find-url.ts` | 书签与历史检索（书签 JSON + `node:sqlite` 历史） |
 | `src/search.ts` | `browser_search` 的引擎表、抽取表达式与回执排版（纯函数，不带浏览器） |
 | `src/search-settings.ts` / `src/search-service.ts` | 搜索配置、优先级路由、失败切换和密钥设置 |
 | `src/search-api.ts` | DeepSeek Search/Fetch、Tavily Search/Extract 接口适配 |
-| `src/own-browser.ts` | 她自己的实例：起停、写发现文件、直接说 CDP（建窗口 / 激活 / 搬窗口） |
+| `src/own-browser.ts` | 她自己的实例：起停、直接说 CDP（建窗口 / 激活 / 搬窗口） |
 | `src/window-raise.ts` | "搬到他眼前"的最后一步：抬 z 序（CDP 做不到，交给 Windows 的 `SetWindowPos`） |
 | `src/page-scripts.ts` | 注入页面执行的 JS：读页（穿 Shadow DOM 与 iframe）、填表 |
 | `src/ENV_PROMPT.md` | 环境提示词模板，占位符 `{{browser.label}}` / `{{browser.kind}}` / `{{browser.front}}` |
-| `scripts/smoke.ts` | 开发用冒烟：对着真的 proxy 走一遍开页、读页、截图；`--own` 时含"能不能播"与"抬不抬得起来" |
-| `tests/` | 干装载、起停、工具回执、变化聚合、专属实例、focus 回执话术；假 proxy 是一个真的 HTTP 服务 |
+| `scripts/smoke.ts` | 开发用冒烟：对着真的浏览器走一遍开页、读页、截图；`--own` 时含"能不能播"与"抬不抬得起来" |
+| `tests/` | 干装载、起停、工具回执、变化聚合、专属实例、focus 回执话术；假浏览器是一个真的会说 CDP 的服务 |
 
 ## 配置
 
-`worlds.browser` 段。必填两项：`skillDir`（装了 web-access 的目录）与 `browser`
-（`chrome` / `edge` / `chromium`，必须是你要操作的那一个）；漏填由 `preflight` 拦下。
+`worlds.browser` 段。必填一项：`browser`（`chrome` / `edge` / `chromium`，
+必须是你要操作的那一个）；漏填由 `preflight` 拦下。
+0.3.x 的 `skillDir` 与 `port` 两项已删除——旧配置里残留的值无害，读进来不再被使用。
 
-上游那边要打开对应浏览器的远程调试开关：地址栏进 `chrome://inspect#remote-debugging`
+借操作员的浏览器时，要打开对应浏览器的远程调试开关：地址栏进 `chrome://inspect#remote-debugging`
 （Edge 是 `edge://inspect#remote-debugging`），勾选「Allow remote debugging for this browser instance」。
 没打开时 World 会投一条 `browser.down`，工具回失败并说明这一步——不是这个包坏了。
 
@@ -108,13 +112,11 @@ cortico-world-browser 的 x.y.z 版本」,就把 Coo 的扩展源改成官方 `h
 | `bringToFront` | 默认 `true`：**允不允许她打断你**（把某个页面搬到你眼前）。这不是"页面能不能播"的开关——她的页面默认在屏幕外，媒体照样播 |
 | `searchEngine` | 兼容旧部署的默认引擎。`search.order` 为空时优先使用它；保存新排序后由新排序决定 |
 
-为什么这样接：上游只从各浏览器**默认 profile** 的 `DevToolsActivePort` 找浏览器（现代 Chrome 用
-`--remote-debugging-port` 启动时并不写这个文件），所以本 World 拉起 proxy 时把"家"当 `LOCALAPPDATA`
-交给它，再由 `own-browser.ts` 把那个文件写在自己家里——上游据此认出这个实例（`/health` 里仍是
-`Chrome`），而操作员日常那个浏览器**一行都不用改**。
+专属实例的调试端口是本 World 自己定的，引擎直连它，不走发现；操作员日常那个浏览器**一行都不用改**。
 
-`find-url.mjs` 查历史要 `sqlite3` 命令在 PATH 上；没有时它自己的报错会原样回到回执里。
-（开了专属实例时，它查的是**她自己那个 profile** 的书签与历史。）
+书签与历史检索在包内（`src/find-url.ts`），历史用 Node 内建的 `node:sqlite` 读（要 Node 22.13+ 或
+23.4+，官方构建自带），不再要求 `sqlite3` 命令在 PATH 上。（开了专属实例时，查的是
+**她自己那个 profile** 的书签与历史。）
 
 ## 搜索与正文抓取（0.3.0）
 
@@ -169,13 +171,13 @@ API 文档：[DeepSeek](https://api-docs.deepseek.com/zh-cn/guides/search/)、[T
 
 ## 起停
 
-先探 `GET /health`，通了就复用（操作员自己或他的 coding agent 已经在跑的情况下不重复拉起），
-探不通才 spawn；`stop()` 只关自己拉起的那个。因此两份东西可以共用一个 proxy。
-专属实例同一套：先探它的 `/json/version`，探得到就复用（顺手把发现文件刷新成它现在的 ws 路径），
-探不到才拉起，`stop()` 同样只关自己拉起的。
+引擎的连接是无状态的：World 启动时发现并连上浏览器；连接断了，下一次工具调用自己重连
+（浏览器重启换了端口也认得，发现缓存会清）。没有常驻子进程，也就没有"复用一个已在跑的 proxy"。
+专属实例那一半不变：先探它的 `/json/version`，探得到就复用，探不到才拉起，
+`stop()` 只关自己拉起的进程。
 
-起好之后还会**核对 proxy 连的确实是那个实例**（`/health` 的 `chromePort`）：端口上挂着一个连别处的
-旧 proxy 时，当场投 `browser.down` 说清，而不是静默地去操作操作员的浏览器。
+引擎停机时会顺手关掉**它自己建出来的**那批后台 tab（与当年 proxy 退出时的行为一致）；
+她的窗口与操作员自己的页面不在那批里，不受影响。
 
 ## 前台与后台（决定她会不会打扰你）
 
@@ -241,32 +243,34 @@ API 文档：[DeepSeek](https://api-docs.deepseek.com/zh-cn/guides/search/)、[T
 ## 失败怎么念（哪一类，决定贴哪句话）
 
 工具失败时回执里会写明是**哪一类**。这不是修辞：2026-09-30 那次就是几类被混成同一句把 bot 带偏了
-——她连着三次 `browser_open example.com` 拿到「连不上 cdp-proxy + 去开远程调试」，于是把
-「browser 别再试了」写进了自己的笔记；而浏览器与 proxy 全程都是好的，打不开的是那个域名。
+——她连着三次 `browser_open example.com` 拿到「连不上 + 去开远程调试」，于是把
+「browser 别再试了」写进了自己的笔记；而浏览器与连接全程都是好的，打不开的是那个域名。
 
 | 哪一类 | 什么情况 | 回执里会说 |
 |---|---|---|
-| 连不上 proxy | HTTP 层面就没通（proxy 没起、或本地超时掐了） | 末尾贴「去开哪个浏览器的远程调试开关」 |
-| 浏览器没连上 | proxy 在，但它没 attach 上浏览器 | 同上——**只有这两类与那个开关有关** |
-| 页面没打开 | 导航那一段没在窗口内完成：多半是这个地址打不开或太慢 | 说清 proxy 与浏览器都是通的，让它换个地址、过会儿再试，别记成浏览器坏了 |
+| 连不上浏览器 | 调试口都没碰到（开关没开、浏览器没在跑、本地超时掐了） | 末尾贴「去开哪个浏览器的远程调试开关」 |
+| 浏览器没连上 | 连上了，但命令被拒（连接刚断、attach 不上） | 同上——**只有这两类与那个开关有关** |
+| 页面没打开 | 导航那一段没在窗口内完成：多半是这个地址打不开或太慢 | 说清连接与浏览器都是通的，让它换个地址、过会儿再试，别记成浏览器坏了 |
 | 命令没回话 | 命令发出去没回话（页面自己卡着） | 同上 |
+| 页面已不在 | target 已经关掉（被回收或被手动关了）——0.4.0 起单列 | 让它 `browser_tabs` 看一眼现在还有哪些，不贴开关那句 |
 
-分类在 `src/cdp-client.ts` 的 `classifyRelayError()`，文案在 `src/world.ts` 的 `explain()`。
+分类在 `src/cdp-engine.ts` 的 `classifyEngineError()`，文案在 `src/world.ts` 的 `explain()`。
 
 ## 开页是两步（认得住页面，不留孤儿）
 
-`browser_open` 先 `POST /new`（正文 `about:blank`，本机量过 167 毫秒）**拿到 targetId 就先认下来**，
-再单独 `POST /navigate` 去那个地址。上游的 `/new` 本来是「建 tab → 导航 → 等加载」一条龙，宿主打不开
-时会拖到它自己的 30 秒 CDP 超时；客户端若在那之前放弃，回执丢了、**tab 就留在他浏览器里没人认领**
+`browser_open` 先 `Target.createTarget` 建**空白**页（`about:blank`，本机量过 167 毫秒）
+**拿到 targetId 就先认下来**，再单独导航去那个地址。一条龙的做法在宿主打不开时会拖到自己的
+30 秒 CDP 超时；客户端若在那之前放弃，回执丢了、**tab 就留在他浏览器里没人认领**
 （`browser_close` 也拒绝关，2026-09-30 那三条 `example.com` 孤儿就是这么来的）。拆开之后，导航失败的
 那个页面仍归 bot：回执里带 target，它稍后可以再读一次或直接关掉。
 
-导航那一段的超时单独放宽到至少 35 秒（`NAV_TIMEOUT_MIN_MS`）：上游的 CDP 超时就是 30 秒，客户端也卡
-30 秒的话永远只能拿到本地那句 `aborted due to timeout`，把上游的真话挡在外面。
+导航那一段的超时单独放宽到至少 35 秒（`NAV_TIMEOUT_MIN_MS`）：慢站点上把导航卡在普通超时里，
+回执只能说「没等到」；宽出来这一截是让引擎把加载等到位、或把真实的失败带回来。
 
 ## B 站视频（0.2.0）
 
 B 站视频在同一个 Browser World 内，共用进程、profile 与页面登记，不需要安装独立视频 World。
+视频模块用 `puppeteer-core` 直连浏览器的调试口（引擎负责把端口告诉它）。
 
 - `browser_video_open`：给 BV 号、B 站网址或上次列表序号打开视频；不填则回首页。
 - `browser_video_attach`：绑定已有 B 站 target；会重新加载并暂停该页，以捕获字幕和弹幕响应。不会取得用户页面的关闭权限。
