@@ -1,6 +1,6 @@
 # Changelog
 
-## 未发布
+## 0.4.1
 
 - 修「她的 Chrome 已经在跑，但没带调试口」时 World 起不来的问题：起浏览器前先认占着她 profile 的
   Chrome 主进程；没带本 World 的调试口就结束它再拉起（Chrome 的单实例机制会让新进程把命令交给
