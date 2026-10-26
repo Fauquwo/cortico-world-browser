@@ -163,7 +163,7 @@ export const BROWSER_SEARCH_TOOL: ToolSpec = {
     additionalProperties: false,
     properties: {
       query: { type: 'string', description: 'What to search for, words as a person would type them.' },
-      engine: { type: 'string', enum: ['deepseek', 'tavily', 'bing', 'sogou', 'baidu'], description: 'Optional explicit engine; otherwise follows Browser search settings.' },
+      engine: { type: 'string', enum: ['deepseek', 'tavily', 'bing', 'sogou', 'baidu', 'google'], description: 'Optional explicit engine; otherwise follows Browser search settings.' },
       count: { type: 'integer', description: `How many results to return; default ${SEARCH_COUNT_DEFAULT}, max ${SEARCH_COUNT_MAX}.` },
     },
     required: ['query'],

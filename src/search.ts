@@ -1,18 +1,17 @@
 /**
  * `browser_search` 的那一半：把关键词拼成结果页地址，再把结果页抽成条目。
  *
- * 为什么是「打开搜索引擎的结果页」而不是调一个搜索 API：这台机器上 Google 与 DuckDuckGo
- * **打不开**（2026-10-12 在她的 Chrome 里量到 `ERR_TIMED_OUT`），而内置的 websearch World
- * 只认 Brave 的密钥（部署里现在是关的）。剩下的现实选项就是在浏览器里搜。
+ * 网页引擎通过浏览器打开结果页，无需 API key。Google 在 2026-10-12 的原部署里曾超时；
+ * 2026-10-26 HTTP 请求已能连上，但返回同意页，实际 Chrome 中仍需处理同意或验证。
  *
- * 选择器全部是 2026-10-12 在真结果页上量出来的，不是照印象写的：
+ * 以下三个引擎的选择器是 2026-10-12 在真结果页上量出来的：
  * - Bing 国内版（`cn.bing.com`）：`#b_results > li.b_algo h2 a` 给 10 条，标题与地址都是**真的**，
  *   摘要在 `.b_caption p`，来源站名在 `.tptt`；
  * - 搜狗：`h3 a` 给 8 条，标题干净，但地址是 `sogou.com/link?url=…` 这种**跳转链接**；
  * - 百度：`#content_left div.result h3 a` 给 6 条，同样是跳转链接，且实测打开跳转链接可能落回
  *   百度自己的页——所以它排在最后。
  *
- * 所以默认引擎是 Bing 国内版：只有它把真地址摆在回执里，而她拿到的正是地址。
+ * 默认引擎沿用 Bing 国内版；它在原部署中已验证能返回真实地址。
  */
 /** 回执里一行东西的上限。与 `world.ts` 的 truncate 不同：这里不要「还有 N 字没显示」那半句——
  *  一行标题后面缀一句说明会把回执撑成两倍长。 */
@@ -20,7 +19,7 @@ function clip(value: string, maxChars: number): string {
   return value.length <= maxChars ? value : `${value.slice(0, maxChars)}…`;
 }
 
-export type SearchEngineId = 'bing' | 'sogou' | 'baidu';
+export type SearchEngineId = 'bing' | 'sogou' | 'baidu' | 'google';
 
 /** 一次搜索默认要几条、最多几条。 */
 export const SEARCH_COUNT_DEFAULT = 10;
@@ -88,17 +87,30 @@ const BAIDU: SearchEngineSpec = {
   caveat: '百度会在标题里塞进噪声字符（它的反爬手段），摘要也常常抽不到：能对照，别照着抄。要用就用 Bing 校对一遍。',
 };
 
+const GOOGLE: SearchEngineSpec = {
+  id: 'google',
+  label: 'Google',
+  pageUrl: (query) => `https://www.google.com/search?q=${encodeURIComponent(query)}`,
+  anchors: ['#search a:has(> h3)', '#search a:has(h3)', 'main a:has(h3)'],
+  snippets: ['.VwiC3b', '[data-sncf]', '.yXK7lf'],
+  sources: ['.VuuXrf'],
+  container: '.MjjYud',
+  redirects: false,
+  caveat: '若打开的是 Google 同意页或验证页，先在浏览器中完成操作，再重试搜索。',
+};
+
 export const SEARCH_ENGINES: Record<SearchEngineId, SearchEngineSpec> = {
   bing: BING,
   sogou: SOGOU,
   baidu: BAIDU,
+  google: GOOGLE,
 };
 
-/** 默认引擎。只有它给真地址。 */
+/** 默认引擎。原部署已验证它能给真地址。 */
 export const SEARCH_ENGINE_DEFAULT: SearchEngineId = 'bing';
 
 export function isSearchEngineId(value: string): value is SearchEngineId {
-  return value === 'bing' || value === 'sogou' || value === 'baidu';
+  return value === 'bing' || value === 'sogou' || value === 'baidu' || value === 'google';
 }
 
 /** 结果页地址。`engine` 不在表里时由调用方先挡掉。 */
@@ -264,7 +276,7 @@ export function renderSearch(engine: SearchEngineId, query: string, harvest: Sea
       harvest.anchors === 0
         ? '这一页上没有匹配到结果的锚点：多半是引擎换了页面结构，或者它给了验证页/空白页。'
         : `页面上有 ${harvest.anchors} 个候选，但一条都没能组成条目（标题或地址是空的）。`;
-    return [head, where, why, opts.fallbackText ? `这一页此刻的正文（自己从里面挑）：\n${opts.fallbackText}` : '']
+    return [head, where, why, spec.caveat ?? '', opts.fallbackText ? `这一页此刻的正文（自己从里面挑）：\n${opts.fallbackText}` : '']
       .filter((part) => part !== '')
       .join('\n');
   }

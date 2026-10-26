@@ -1,11 +1,11 @@
 import type { ConfigGroup } from 'cortico/core/types.ts';
 import { isSearchEngineId, type SearchEngineId } from './search.ts';
 
-export const SEARCH_PROVIDERS = ['deepseek', 'tavily', 'bing', 'sogou', 'baidu'] as const;
+export const SEARCH_PROVIDERS = ['deepseek', 'tavily', 'bing', 'sogou', 'baidu', 'google'] as const;
 export type SearchProviderId = typeof SEARCH_PROVIDERS[number];
 export type ApiSearchProviderId = 'deepseek' | 'tavily';
 export const SEARCH_LABELS: Record<SearchProviderId, string> = {
-  deepseek: 'DeepSeek', tavily: 'Tavily', bing: 'Bing 国内版', sogou: '搜狗', baidu: '百度',
+  deepseek: 'DeepSeek', tavily: 'Tavily', bing: 'Bing 国内版', sogou: '搜狗', baidu: '百度', google: 'Google',
 };
 export const SEARCH_SECRETS: Record<ApiSearchProviderId, string> = {
   deepseek: 'CORTICO_BROWSER_DEEPSEEK_API_KEY', tavily: 'CORTICO_BROWSER_TAVILY_API_KEY',
@@ -20,12 +20,13 @@ export interface BrowserSearchConfig {
   bing: { enabled: boolean };
   sogou: { enabled: boolean };
   baidu: { enabled: boolean };
+  google: { enabled: boolean };
 }
 
 export const SEARCH_DEFAULTS: BrowserSearchConfig = {
   order: '', fallbackEnabled: false,
   deepseek: { enabled: true }, tavily: { enabled: true, searchDepth: 'basic' },
-  bing: { enabled: true }, sogou: { enabled: true }, baidu: { enabled: true },
+  bing: { enabled: true }, sogou: { enabled: true }, baidu: { enabled: true }, google: { enabled: true },
 };
 
 export function isSearchProvider(value: string): value is SearchProviderId {
@@ -46,7 +47,7 @@ export const SEARCH_CONFIG_GROUP: ConfigGroup = {
   schema: { type: 'object', title: '网页搜索与抓取', properties: {
     'worlds.browser.search.order': {
       type: 'string', title: '引擎顺序',
-      description: '在「搜索设置」面板拖拽排序。逗号分隔 deepseek、tavily、bing、sogou、baidu；空白沿用旧默认引擎。', 'x-hot': true,
+      description: '在「搜索设置」面板拖拽排序。逗号分隔 deepseek、tavily、bing、sogou、baidu、google；空白沿用旧默认引擎。', 'x-hot': true,
     },
     'worlds.browser.search.fallbackEnabled': {
       type: 'boolean', title: '失败后自动切换', description: '超时、限流或服务不可用时按顺序切换。无结果、密钥无效、余额不足或主动取消时停止。', 'x-hot': true,

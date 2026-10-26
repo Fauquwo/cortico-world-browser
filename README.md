@@ -120,7 +120,7 @@ cortico-world-browser 的 x.y.z 版本」,就把 Coo 的扩展源改成官方 `h
 
 ## 搜索与正文抓取（0.3.0）
 
-在 Browser World 的「搜索设置」面板拖拽或用上下箭头调整 DeepSeek、Tavily、Bing、搜狗和百度的顺序，并勾选启用项。保存后下次搜索生效。默认取第一个已启用且配置完整的引擎；未填写密钥的 API 引擎自动跳过。
+在 Browser World 的「搜索设置」面板拖拽或用上下箭头调整 DeepSeek、Tavily、Bing、搜狗、百度和 Google 的顺序，并勾选启用项。保存后下次搜索生效。默认取第一个已启用且配置完整的引擎；未填写密钥的 API 引擎自动跳过。
 
 同一面板分别填写 DeepSeek 和 Tavily API key。密钥由宿主写入部署 `.env`，变量名为 `CORTICO_BROWSER_DEEPSEEK_API_KEY`、`CORTICO_BROWSER_TAVILY_API_KEY`；配置和页面状态仅包含是否已配置。无需更换 bot 的模型。
 
@@ -139,13 +139,16 @@ API 文档：[DeepSeek](https://api-docs.deepseek.com/zh-cn/guides/search/)、[T
 她原话：「浏览器给我的是『打开这个地址、读正文』，没有『搜』这一步，主题一模糊我就只剩猜域名、翻站内导航两条路。」
 `browser_search` 填的就是这一步：一次调用把关键词变成一批**地址**（标题 + 地址 + 一句摘要），她拿地址去 `browser_open`。
 
-网页引擎不需要 API key。2026-10-12 在本机 Chrome 中测得 Google 与 DuckDuckGo 超时，Bing 国内版、搜狗、百度可用；以下选择器来自当天的结果页：
+网页引擎不需要 API key。2026-10-12 在原部署的 Chrome 中，Google 与 DuckDuckGo 超时；Bing 国内版、搜狗、百度可用，以下三者的选择器来自当天的结果页。2026-10-26 当前环境的 HTTP 请求已能连接 Google，但收到同意页，尚未在运行中的 Chrome 结果页验证抽取选择器。
 
 | 引擎 | 结果锚点 | 抽到几条 | 地址是 | 摘要 |
 |---|---|---|---|---|
 | Bing 国内版（默认） | `#b_results > li.b_algo h2 a` | 10 | **真地址** | `.b_caption p`，来源站名在 `.tptt` |
 | 搜狗 | `h3 a` | 8 | `sogou.com/link?url=…` 跳转链接 | `.text-layout` / `.space-txt` |
 | 百度 | `#content_left div.result h3 a` | 6 | `baidu.com/link?url=…` 跳转链接 | 有时在 `[class*=abstract]` |
+| Google | `#search a:has(> h3)` 等候选 | 尚未实测 | 预期为结果地址 | `.VwiC3b` 等候选 |
+
+Google 首次使用可能打开同意或验证页。先在该浏览器处理页面，再重试 `browser_search`；若结果页结构不同，应按真实 DOM 调整 `src/search.ts` 中的候选选择器。
 
 跳转链接**直接打开**会落到真页（量过搜狗那条落到知乎文章），但地址上看不出站点；百度更差一点 ——
 实测有跳转链接打开后落回百度自己的页。旧部署默认 Bing 国内版；工具参数 `engine` 可以按次覆盖。

@@ -144,7 +144,7 @@ export const BROWSER_CONFIG_GROUP: ConfigGroup = {
         title: '旧配置的默认搜索引擎',
         description:
           '仅在新引擎顺序为空时生效。请在「搜索设置」面板排序并启用引擎。',
-        enum: ['bing', 'sogou', 'baidu'],
+        enum: ['bing', 'sogou', 'baidu', 'google'],
         'x-hot': true,
       },
     },

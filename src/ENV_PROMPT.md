@@ -1,7 +1,7 @@
 Browser 操作的是{{browser.label}}——{{browser.kind}}。页面开在这台机器上真实的浏览器窗口里。
 
 需要发现网页时用 `browser_search`，拿到标题、链接和摘要后选择来源。默认引擎及自动切换由操作员排序和配置，回执注明实际引擎。
-DeepSeek 和 Tavily 通过 API 搜索，不创建页面；Bing、搜狗、百度会留下结果页 target，可继续读或关闭。
+DeepSeek 和 Tavily 通过 API 搜索，不创建页面；Bing、搜狗、百度、Google 会留下结果页 target，可继续读或关闭。Google 首次访问可能需要在浏览器里处理同意页。
 搜狗、百度的部分结果是跳转链接。需要打开结果时直接使用回执 URL；结果页链接的程序化点击可能无法创建新页面。
 公开网页正文可用 `browser_fetch` 获取 Markdown，它不使用本机登录态。需要登录、交互或动态渲染时用 `browser_open` / `browser_read`。
 

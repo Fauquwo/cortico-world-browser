@@ -50,7 +50,7 @@ export class BrowserSearchService {
     const legacy = isSearchEngineId(cfg.searchEngine) ? cfg.searchEngine : 'bing';
     return {
       order: providerOrder(search.order, legacy),
-      enabled: Object.fromEntries(SEARCH_PROVIDERS.map(id => [id, search[id].enabled])) as SearchSettingsState['enabled'],
+      enabled: Object.fromEntries(SEARCH_PROVIDERS.map(id => [id, search[id]?.enabled ?? SEARCH_DEFAULTS[id].enabled])) as SearchSettingsState['enabled'],
       configured: { deepseek: !!this.key('deepseek'), tavily: !!this.key('tavily') },
       fallbackEnabled: search.fallbackEnabled, tavilySearchDepth: search.tavily.searchDepth,
     };

@@ -41,10 +41,10 @@ export const BROWSER: WorldDefinition<BrowserConfigSection> = {
     if (!BROWSERS.includes(browser)) {
       throw new Error(`worlds.browser.browser 只能是 ${BROWSERS.join(' / ')}，现在是「${browser}」。`);
     }
-    // 搜索那一路：只认量过能用的三个（Google 与 DuckDuckGo 在这台机器上打不开）。
+    // 搜索那一路：只认已声明的网页引擎。
     if (!isSearchEngineId(String(ctx.cfg.searchEngine))) {
       throw new Error(
-        `worlds.browser.searchEngine 只能是 bing / sogou / baidu，现在是「${String(ctx.cfg.searchEngine)}」。`,
+        `worlds.browser.searchEngine 只能是 bing / sogou / baidu / google，现在是「${String(ctx.cfg.searchEngine)}」。`,
       );
     }
     // 专属实例那几项：开着就必须填全，漏什么在这里点名，别等运行起来才发现她没手。
