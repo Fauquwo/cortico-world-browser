@@ -532,7 +532,7 @@ export class BrowserWorld implements World {
           log.warn('她自己的浏览器起不来', { error: ownProblem });
           await this.emit(
             'browser.down',
-            `浏览器起不来：${ownProblem}。（看 worlds.browser.ownBrowserExe 与 ownBrowserHome 配得对不对。）`,
+            `浏览器起不来：${ownProblem}。（先看 worlds.browser.ownBrowserExe 与 ownBrowserHome 配得对不对；都对的话，可能是同一个 profile 已经有一个没带调试口的 Chrome 在跑——把它完全退出，再让 World 起一次。）`,
           );
           return;
         }

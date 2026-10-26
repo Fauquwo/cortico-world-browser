@@ -93,6 +93,118 @@ interface VersionInfo {
   wsUrl: string;
 }
 
+/** 进程清单里的一行（只用于 Windows 上找「占着她 profile 的那个 Chrome」）。 */
+export interface ChromeProcessRow {
+  pid: number;
+  commandLine: string;
+}
+
+function normalizeWinPath(value: string): string {
+  return value.replace(/\//g, '\\').replace(/\\+$/, '').toLowerCase();
+}
+
+/**
+ * 从进程清单里挑出「占着她这个 profile 的浏览器主进程」。
+ *
+ * Chrome 的子进程（渲染器、GPU、crashpad）命令行里带 `--type=`，它们不是拦住新实例的那一个；
+ * 主进程才持有 profile 的单实例锁。比较时忽略大小写与斜杠方向：配置里可能写正斜杠，
+ * 而 Windows 的进程命令行是反斜杠。
+ */
+export function pickProfileHolders(rows: readonly ChromeProcessRow[], profileDir: string): ChromeProcessRow[] {
+  const needle = normalizeWinPath(profileDir);
+  if (needle === '') return [];
+  return rows.filter((row) => {
+    const commandLine = row.commandLine.toLowerCase().replace(/\//g, '\\');
+    return !commandLine.includes('--type=') && commandLine.includes('--user-data-dir=') && commandLine.includes(needle);
+  });
+}
+
+function hasDebugPort(commandLine: string, port: number): boolean {
+  return new RegExp(`--remote-debugging-port=${port}(?!\\d)`).test(commandLine);
+}
+
+/** 操作员日常那个 profile 的默认位置；万一 ownBrowserHome 指到这里，绝不代他杀进程。 */
+function isDefaultChromeProfile(profileDir: string): boolean {
+  const localAppData = process.env.LOCALAPPDATA;
+  if (!localAppData) return false;
+  return normalizeWinPath(profileDir) === normalizeWinPath(join(localAppData, 'Google', 'Chrome', 'User Data'));
+}
+
+const LIST_CHROME_SCRIPT = `
+$ErrorActionPreference = 'SilentlyContinue'
+Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | ForEach-Object {
+  if ($_.CommandLine) { "{0}|{1}" -f $_.ProcessId, $_.CommandLine }
+}
+`.trim();
+
+function runPowerShell(script: string, timeoutMs: number): Promise<string | null> {
+  if (process.platform !== 'win32') return Promise.resolve(null);
+  const encoded = Buffer.from(script, 'utf16le').toString('base64');
+  return new Promise((resolve) => {
+    let settled = false;
+    let output = '';
+    const finish = (value: string | null) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    let child: ChildProcess;
+    try {
+      child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded], {
+        windowsHide: true,
+      });
+    } catch {
+      finish(null);
+      return;
+    }
+    const timer = setTimeout(() => {
+      try {
+        child.kill();
+      } catch {
+        // 已经退了
+      }
+      finish(null);
+    }, timeoutMs);
+    child.stdout?.on('data', (chunk) => {
+      output += String(chunk);
+    });
+    child.on('error', () => {
+      clearTimeout(timer);
+      finish(null);
+    });
+    child.on('close', () => {
+      clearTimeout(timer);
+      finish(output);
+    });
+  });
+}
+
+async function listChromeProcesses(): Promise<ChromeProcessRow[]> {
+  const output = await runPowerShell(LIST_CHROME_SCRIPT, 5000);
+  if (!output) return [];
+  const rows: ChromeProcessRow[] = [];
+  for (const line of output.split(/\r?\n/)) {
+    const separator = line.indexOf('|');
+    if (separator <= 0) continue;
+    const pid = Number(line.slice(0, separator));
+    if (!Number.isInteger(pid) || pid <= 0) continue;
+    rows.push({ pid, commandLine: line.slice(separator + 1) });
+  }
+  return rows;
+}
+
+function killProcessTree(pid: number): Promise<void> {
+  return new Promise((resolve) => {
+    try {
+      const child = spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+      child.on('error', () => resolve());
+      child.on('close', () => resolve());
+    } catch {
+      resolve();
+    }
+  });
+}
+
 /** 从浏览器自己的 HTTP 口读 `/json/version`。 */
 async function readVersion(cdpPort: number, timeoutMs: number): Promise<VersionInfo | null> {
   try {
@@ -157,6 +269,8 @@ export class OwnBrowser {
       return `建不了她的浏览器目录：${describe(err)}`;
     }
 
+    await this.clearStaleProfileHolders(log);
+
     const args = ownBrowserArgs(this.opts);
     try {
       const child = spawn(exe, args, {
@@ -189,7 +303,38 @@ export class OwnBrowser {
       }
       await sleep(READY_POLL_MS);
     }
-    return `浏览器起来了但调试口 ${this.opts.cdpPort} 没响应（等了 ${Math.round(timeoutMs / 1000)} 秒）`;
+    const holders =
+      process.platform === 'win32' ? pickProfileHolders(await listChromeProcesses(), chromeProfileDir(this.opts.home)) : [];
+    const heldNote =
+      holders.length > 0
+        ? `；她的 profile 正被 Chrome 占着（PID ${holders.map((row) => row.pid).join('、')}），那个进程没带调试口就结束它再起一次`
+        : '';
+    return `浏览器起来了但调试口 ${this.opts.cdpPort} 没响应（等了 ${Math.round(timeoutMs / 1000)} 秒）${heldNote}`;
+  }
+
+  /**
+   * 起之前先清掉「占着她的 profile、却没带调试口」的旧 Chrome。
+   *
+   * 为什么需要这一步：Chrome 认 profile 的单实例锁；同一个 profile 已经有一个进程在跑时，
+   * 新启动的 chrome.exe 只是把命令行交给它然后自己退出——老进程不会中途长出调试口，于是
+   * 9223 永远等不到，而报错文案却把人往 ownBrowserExe/ownBrowserHome 上引。那个进程是她这个
+   * 专属实例的（不是操作员日常那个浏览器），结束它再拉起才是对的。
+   *
+   * 只认主进程（子进程带 `--type=`），且只动没带**本 World 调试口**的那些：上一次启动可能还在
+   * 开端口，带了口子的进程留给它自己起完。
+   */
+  private async clearStaleProfileHolders(log: Logger): Promise<void> {
+    if (process.platform !== 'win32') return;
+    const profileDir = chromeProfileDir(this.opts.home);
+    if (isDefaultChromeProfile(profileDir)) return;
+    const holders = pickProfileHolders(await listChromeProcesses(), profileDir);
+    const stale = holders.filter((row) => !hasDebugPort(row.commandLine, this.opts.cdpPort));
+    if (stale.length === 0) return;
+    log.warn?.('她的 profile 被一个没带调试口的 Chrome 占着：先结束它再拉起', {
+      pids: stale.map((row) => row.pid),
+    });
+    for (const row of stale) await killProcessTree(row.pid);
+    await sleep(300);
   }
 
   /**

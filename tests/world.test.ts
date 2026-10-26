@@ -12,7 +12,7 @@ import { dryMountWorld, fakeWorldContext } from 'cortico/extensions/dry-mount.ts
 import { EngineError, classifyEngineError } from '../src/cdp-engine.ts';
 import type { BrowserConfigSection } from '../src/config.ts';
 import { BROWSER } from '../src/definition.ts';
-import { OwnBrowser, chromeProfileDir, ownBrowserArgs } from '../src/own-browser.ts';
+import { OwnBrowser, chromeProfileDir, ownBrowserArgs, pickProfileHolders } from '../src/own-browser.ts';
 import { findUrl } from '../src/find-url.ts';
 import type { BrowserWorld } from '../src/world.ts';
 import { FakeHost } from './helpers/fake-host.ts';
@@ -685,6 +685,21 @@ describe('她自己的浏览器实例', () => {
 
   it('profile 的位置：照 Chrome 自己的布局放在她的"家"里', () => {
     expect(chromeProfileDir('H')).toBe(join('H', 'Google', 'Chrome', 'User Data'));
+  });
+
+  it('认得出占着她 profile 的旧 Chrome 主进程；子进程与他家 profile 都不算', () => {
+    const profile = 'F:\\her\\Google\\Chrome\\User Data';
+    const rows = [
+      // 主进程：没有 --type=，命令行里带着她的 profile。
+      { pid: 11, commandLine: `"C:\\chrome.exe" --user-data-dir=${profile} --remote-debugging-port=9223` },
+      // 渲染器/GPU 这类子进程也带 profile，但它们不是拦住新实例的那一个。
+      { pid: 12, commandLine: `"C:\\chrome.exe" --type=renderer --user-data-dir="F:\\her\\Google\\Chrome\\User"` },
+      // 操作员日常那个 profile：不能碰。
+      { pid: 13, commandLine: `"C:\\chrome.exe" --user-data-dir=F:\\his\\Google\\Chrome\\User Data --remote-debugging-port=9222` },
+      // 配置里写正斜杠、大小写不一样，也要认出来。
+      { pid: 14, commandLine: `"C:\\chrome.exe" --user-data-dir=f:/HER/Google/Chrome/User Data` },
+    ];
+    expect(pickProfileHolders(rows, profile).map((row) => row.pid)).toEqual([11, 14]);
   });
 
   it('实例已经在跑时：复用它（不 spawn）', async () => {
